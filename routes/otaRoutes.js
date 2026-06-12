@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { cameraList, releseFirmware, updateOtaLatestRelease } = require('../controllers/otaController');
+const { cameraList, releseFirmware, updateOtaLatestRelease, secureOta, checkUpdate, getRolloutStatus } = require('../controllers/otaController');
 const { isAuthenticatedUser } = require('../middleware/authMiddleware');
 const { addFirmware } = require('../controllers/cameraController');
 const { getOTA, setOTA } = require('../controllers/settingsController');
@@ -26,5 +26,12 @@ router.post('/addFirmware', isAuthenticatedUser, addFirmware);
 router.get('/checkOtaStatus', isAuthenticatedUser, getOTA);
 router.get('/setota', isAuthenticatedUser, setOTA);
 router.post('/updateOtaLatestRelease', isAuthenticatedUser, upload.single('file'), updateOtaLatestRelease);
+// These two are called both from the EMS UI (browser with JWT) AND from
+// other backends (VMS proxy with mTLS only). Skip the JWT check — the nginx
+// mTLS gate at ems.devices.arcisai.io already restricts access to trusted
+// clients presenting the arcisai wildcard client cert.
+router.post('/secureOta', secureOta);
+router.get('/secureOta/status', getRolloutStatus);
+router.get('/checkUpdate', checkUpdate);
 
 module.exports = router;

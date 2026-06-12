@@ -2,11 +2,11 @@ const axios = require("axios");
 const https = require("https");
 const Config = require("../models/Config");
 const p2predirect = require("../models/p2predirect");
-
+const fs = require('fs');
 const httpsAgent = new https.Agent({
-  cert: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/wildcard.crt")),
-  key: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/wildcard.key")),
-  ca: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/ca-chain.pem")),
+  cert: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/wildcard.crt"),
+  key: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/wildcard.key"),
+  ca: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/ca-chain.pem"),
   rejectUnauthorized: true, // IMPORTANT for production
 });
 

@@ -1,5 +1,5 @@
 const mqtt = require('mqtt');
-
+const fs = require('fs');
 let client = null;
 let latestMessage = null;
 let latestMessagemedia = null;
@@ -59,10 +59,20 @@ const resetTimeoutAndCheckStorage = (topic, parsedMessage) => {
 
 // Function to connect to MQTT broker
 function connectToMQTT() {
+   // const mqttOptions = {
+     //   username: process.env.mqttuser,
+     //   password: process.env.password,
+   // };
     const mqttOptions = {
-        username: process.env.mqttuser,
-        password: process.env.password,
-    };
+    protocol: 'mqtts',
+    port: 8883,
+    ca: fs.readFileSync('/etc/ssl/rahul-arcisai-hsm/ca-chain.pem'),
+    cert: fs.readFileSync('/etc/ssl/rahul-arcisai-hsm/wildcard.crt'),
+    key: fs.readFileSync('/etc/ssl/rahul-arcisai-hsm/wildcard.key'),
+    username: process.env.mqttuser,
+    password: process.env.password,
+    rejectUnauthorized: true,
+	};
 
     client = mqtt.connect(process.env.mqtt_broker_url, mqttOptions);
 

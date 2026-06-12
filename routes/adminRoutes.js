@@ -21,5 +21,5 @@ router.post('/deleteCameraFromUser', isAuthenticatedUser, deleteCameraFromUser);
 router.post('/bulkAddCamerasToUser', isAuthenticatedUser, bulkAddCamerasToUser);
 router.post('/updateUserCamera', isAuthenticatedUser, authorizeRoles('admin'), updateCamera);
 router.get('/flushRedis', flushRedis);
-router.get("/getAbdDevice",isAuthenticatedUser,getAbdDevice)
+//router.get("/getAbdDevice",isAuthenticatedUser,getAbdDevice)
 module.exports = router;

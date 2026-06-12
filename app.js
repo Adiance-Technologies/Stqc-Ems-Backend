@@ -5,25 +5,29 @@ const userRoutes = require('./routes/userRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
 const mqttRoutes = require('./routes/dataRoute');
 const cameraRoutes = require('./routes/cameraRoute');
-const healthRoutes = require('./routes/healthRoutes');
+//const healthRoutes = require('./routes/healthRoutes');
 // const videoRoutes = require('./routes/videoRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const otaRutes = require('./routes/otaRoutes');
+// Provisioning + v2 station endpoints moved to MPS (Manufacturing Platform
+// Server) on 2026-05-02. Reachable at https://mps.devices.arcisai.io and
+// also via path-based routing on https://ems.devices.arcisai.io/backend/api/{provision,v2}/*
+// (nginx forwards both to MPS:5002). See /home/rahul/arcisai-mps/.
 const mqttService = require('./services/mqttService');
-const supportRoutes = require('./routes/supportRoutes');
-const batchRoutes = require('./routes/batchRoutes');
-const stqcUserRoutes = require('./routes/stqcUserRoute');
-const macRoutes = require('./routes/macRoutes');
-const versionRoutes = require('./routes/versionRoutes');
-const genRequestsRoutes = require('./routes/genRequestsRoutes');
-const deptRoutes = require('./routes/deptRoutes');
-const abdRoutes = require("./routes/abdRoutes");
+//const supportRoutes = require('./routes/supportRoutes');
+//const batchRoutes = require('./routes/batchRoutes');
+//const stqcUserRoutes = require('./routes/stqcUserRoute');
+//const macRoutes = require('./routes/macRoutes');
+//const versionRoutes = require('./routes/versionRoutes');
+//const genRequestsRoutes = require('./routes/genRequestsRoutes');
+//const deptRoutes = require('./routes/deptRoutes');
+//const abdRoutes = require("./routes/abdRoutes");
 const connectDB = require('./utils/db');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const helmet = require('helmet');
 const { createProxyMiddleware } = require('http-proxy-middleware');
-const quotationRoutes = require("./routes/quotationUploadRoutes");
+//const quotationRoutes = require("./routes/quotationUploadRoutes");
 const { BASE_PDFS_DIR } = require('./middleware/uploadFile'); // adjust relative path if needed
 
 // require('./services/mqttHelper');
@@ -41,7 +45,7 @@ require("dotenv").config({ path: ".env" });
 // Enable CORS
 app.use(cors(
     {
-        origin: ["https://ems.ambicam.com", "https://ems.ambicam.com/backend", "http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "https://admin.arcisai.io", "https://www.adiance.com"],
+        origin: ["https://ems.devices.arcisai.io/dash"],
         credentials: true,
         methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
         allowedHeaders: ['Origin, X-Requested-With, Content-Type, Accept, Authorization', 'x-api-key'],
@@ -92,19 +96,20 @@ app.use('/api/users', userRoutes);
 app.use('/api', settingsRoutes);
 app.use('/api/alert', mqttRoutes);
 app.use('/api/camera', cameraRoutes);
-app.use('/api/health', healthRoutes);
+//app.use('/api/health', healthRoutes);
 // app.use('/api/video', videoRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/ota', otaRutes);
-app.use('/api/support', supportRoutes);
-app.use('/api/production', batchRoutes);
-app.use('/api/stqc', stqcUserRoutes);
-app.use('/api/mac', macRoutes);
-app.use('/api/version', versionRoutes);
-app.use('/api/reqs', genRequestsRoutes);
-app.use('/api/department', deptRoutes);
-app.use("/api/quotations", quotationRoutes);
-app.use("/api/abd", abdRoutes);
+// app.use('/api/provision', ...) and app.use('/api/v2', ...) — moved to MPS.
+//app.use('/api/support', supportRoutes);
+//app.use('/api/production', batchRoutes);
+//app.use('/api/stqc', stqcUserRoutes);
+//app.use('/api/mac', macRoutes);
+//app.use('/api/version', versionRoutes);
+//app.use('/api/reqs', genRequestsRoutes);
+//app.use('/api/department', deptRoutes);
+//app.use("/api/quotations", quotationRoutes);
+//app.use("/api/abd", abdRoutes);
 
 
 // Proxy middleware to forward requests to target server

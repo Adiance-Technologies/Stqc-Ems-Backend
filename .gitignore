@@ -2,3 +2,5 @@
 /.env
 /config
 /pdfs/requirement/quotation/default
+/batch_output
+*.save

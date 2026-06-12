@@ -25,9 +25,9 @@ const mqttClient = mqtt.connect('https://ems.devices.arcisai.io:8883', {
 
 // HTTPS Agent for self-signed certs
 const httpsAgent = new https.Agent({
-    cert: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/wildcard.crt")),
-    key: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/wildcard.key")),
-    ca: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/ca-chain.pem")),
+    cert: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/wildcard.crt"),
+    key: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/wildcard.key"),
+    ca: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/ca-chain.pem"),
     rejectUnauthorized: true, // IMPORTANT for production
 });
 

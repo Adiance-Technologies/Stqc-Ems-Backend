@@ -12,16 +12,16 @@ const History = require('../models/history');
 const mongoose = require('mongoose');
 const https = require('https');
 const axios = require('axios');
-const apiUrl = `${process.env.P2P_URL}`;
+//const apiUrl = `${process.env.P2P_URL}`;
 const path = require('path');
 const fs = require('fs');
 const ffmpeg = require('fluent-ffmpeg');
 
 // create instance of axios with custom config
 const httpsAgent = new https.Agent({
-    cert: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/wildcard.crt")),
-    key: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/wildcard.key")),
-    ca: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/ca-chain.pem")),
+    cert: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/wildcard.crt"),
+    key: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/wildcard.key"),
+    ca: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/ca-chain.pem"),
     rejectUnauthorized: true, // IMPORTANT for production
 });
 const instance = axios.create({
@@ -327,19 +327,21 @@ const streamVideo = (videoPath, deviceId) => {
 };
 
 const updateCamerasFromProxy = async () => {
-    try {
-        console.log('Fetching proxy data...');
-
+//    	console.log(process.env.P2P_URL,process.env.P2P_API_KEY);
+	try {
+       
+	console.log('Fetching proxy data...');
+	
         // Fetch proxy data
-        const response = await axios.get(apiUrl, {
+        const response = await axios.get(process.env.P2P_URL,{
             httpsAgent,
             headers: {
                 "X-API-Key": process.env.P2P_API_KEY,
                 "Accept": "application/json"
             },
-            timeout: 15000
+        
         });
-
+//console.log(response)
         const proxies = response.data.proxies;
 
         if (!proxies || proxies.length === 0) {
@@ -438,7 +440,7 @@ exports.getP2PCameras = async (req, res) => {
 
 
 exports.addP2PCamera = async (req, res) => {
-    const { deviceId, productType, isPTZ } = req.body;
+    const { deviceId, productType, isPTZ, otaDeviceToken } = req.body;
     try {
         const userEmail = req.user.email;
         // Regular expression for the format XXXX-XXXXXX-XXXXX
@@ -470,7 +472,8 @@ exports.addP2PCamera = async (req, res) => {
             deviceId,
             productType,
             mqttUrl,
-            isPTZ
+            isPTZ,
+            otaDeviceToken: otaDeviceToken || null,
         });
         await newp2p.save();
 
@@ -1008,3 +1011,39 @@ exports.addFirmware = async (req, res) => {
         res.status(500).json({ message: error.message })
     }
 }
+
+// One-time save of the OTA device token for an existing camera.
+// Called by firmware engineer after provisioning to record the per-device
+// token used as the `deviceToken` field in channel-62 secure-OTA payloads.
+// Refuses to overwrite an already-set token — the token never expires, so
+// changing it would typically indicate a data-entry mistake, not a rotation.
+exports.setOtaToken = async (req, res) => {
+    const { deviceId, otaDeviceToken } = req.body;
+
+    if (!deviceId || !otaDeviceToken) {
+        return res.status(400).json({ message: 'deviceId and otaDeviceToken are required' });
+    }
+
+    try {
+        const existing = await p2predirect.findOne({ deviceId });
+        if (!existing) {
+            return res.status(404).json({ message: `Camera ${deviceId} not found in p2predirect` });
+        }
+        if (existing.otaDeviceToken) {
+            return res.status(409).json({
+                message: `OTA device token is already set for ${deviceId} and cannot be changed`,
+            });
+        }
+
+        existing.otaDeviceToken = otaDeviceToken;
+        await existing.save();
+
+        return res.status(200).json({
+            message: 'OTA device token saved',
+            deviceId: existing.deviceId,
+        });
+    } catch (error) {
+        console.error('setOtaToken error:', error);
+        return res.status(500).json({ message: error.message });
+    }
+};

@@ -12,6 +12,10 @@ const redirects = new mongoose.Schema({
         type: Number,
         default: 0
     },
+    otaDeviceToken: {
+        type: String,
+        default: null,
+    },
 });
 
 module.exports = mongoose.model('p2predirects', redirects);

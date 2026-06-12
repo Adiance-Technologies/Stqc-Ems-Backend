@@ -1,16 +1,27 @@
 const Firmware = require('../models/firmware');
+const p2predirect = require('../models/p2predirect');
 const axios = require('axios');
 const https = require('https');
 const fs = require('fs');
+const path = require('path');
+const mqtt = require('mqtt');
 const FormData = require('form-data');
 const FirmwareOtaRelease = require('../models/firmwareOtaRelease');
 const apiUrl = `${process.env.MQTT_CONNECTED_DEVICES}`;
 
+// Root directory where firmware releases are dropped. Each release lives in
+// its own tag-named subdirectory and carries a manifest.json describing the
+// .rom file, sha256, productType, publishedAt, and release notes.
+const FIRMWARE_ROOT = process.env.FIRMWARE_ROOT || '/home/rahul/augentix-mqtt/firmware';
+const FIRMWARE_PUBLIC_BASE = process.env.FIRMWARE_PUBLIC_BASE || 'https://ems.devices.arcisai.io/firmware';
+const appTopicSend = 'torque/app/tx/';
+const appTopicReceive = 'torque/app/rx/';
+
 
 const httpsAgent = new https.Agent({
-    cert: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/wildcard.crt")),
-    key: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/wildcard.key")),
-    ca: fs.readFileSync(path.join(__dirname, "/etc/ssl/rahul-arcisai-hsm/ca-chain.pem")),
+    cert: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/wildcard.crt"),
+    key: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/wildcard.key"),
+    ca: fs.readFileSync("/etc/ssl/rahul-arcisai-hsm/ca-chain.pem"),
     rejectUnauthorized: true, // IMPORTANT for production
 });
 
@@ -127,9 +138,11 @@ exports.releseFirmware = async (req, res, next) => {
 
         // Upload to Prong
         const uploadResponse = await axios.post(
-            'https://ems.devices.arcisai.io/upload',
+            'https://ems.devices.arcisai.io/firmware/upload',
             form,
-            { headers: { ...form.getHeaders() } }
+            { 
+httpsAgent,
+headers: { ...form.getHeaders() } }
         );
 
         // DELETE LOCAL FILE IMMEDIATELY AFTER UPLOAD ATTEMPT (Success Case)
@@ -394,6 +407,374 @@ exports.updateOtaLatestRelease = async (req, res) => {
     } catch (error) {
         console.error('Error creating or updating firmware release:', error);
         return res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
+// Read manifest.json for a given release tag.
+// Returns { tag, file, sha256, productType, publishedAt, releaseNotes } or throws.
+function readReleaseManifest(tag) {
+    const manifestPath = path.join(FIRMWARE_ROOT, tag, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+        throw new Error(`manifest.json not found for release ${tag}`);
+    }
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+    if (!manifest.file || !manifest.sha256) {
+        throw new Error(`manifest.json for ${tag} is missing file or sha256`);
+    }
+    return manifest;
+}
+
+// List every release by reading every */manifest.json under FIRMWARE_ROOT.
+// Ignores directories without a manifest (e.g. legacy manual drops).
+function listReleaseManifests() {
+    if (!fs.existsSync(FIRMWARE_ROOT)) return [];
+    return fs.readdirSync(FIRMWARE_ROOT, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => {
+            try {
+                const m = readReleaseManifest(d.name);
+                return { ...m, tag: m.tag || d.name };
+            } catch {
+                return null;
+            }
+        })
+        .filter(Boolean);
+}
+
+// Rank manifests newest-first, preferring publishedAt, falling back to tag.
+// productType match is lenient: manifest.productType can be a prefix/substring
+// of the device's productType or vice-versa, so "Augentix" matches
+// "Augentix Camera" / "Augentix-4GBDP" etc.
+function pickLatestManifest(manifests, productType) {
+    const q = (productType || '').toLowerCase();
+    const filtered = q
+        ? manifests.filter(m => {
+            const p = (m.productType || '').toLowerCase();
+            return !p || p === q || p.includes(q) || q.includes(p);
+          })
+        : manifests.slice();
+    filtered.sort((a, b) => {
+        const da = a.publishedAt ? new Date(a.publishedAt).getTime() : 0;
+        const db = b.publishedAt ? new Date(b.publishedAt).getTime() : 0;
+        if (db !== da) return db - da;
+        return String(b.tag).localeCompare(String(a.tag));
+    });
+    return filtered[0] || null;
+}
+
+// ============================================================================
+// Secure-OTA rollout state machine — retries once on any error or silence.
+// In-memory only; keyed by deviceId. One rollout per device at a time.
+// ============================================================================
+
+const crypto = require('crypto');
+
+const MAX_ATTEMPTS = 2;                      // first click + one retry
+const WATCHDOG_MS = 5 * 60 * 1000;           // 5 min of silence → retry
+const RETRY_BACKOFF_MS = 2000;
+const EVICT_AFTER_TERMINAL_MS = 10 * 60 * 1000;
+
+// deviceId -> rollout record
+const otaRollouts = new Map();
+
+function newOtaMqttClient() {
+    return mqtt.connect(process.env.mqtt_broker_url, {
+        username: process.env.mqttuser,
+        password: process.env.password,
+        cert: fs.readFileSync('/etc/ssl/rahul-arcisai-hsm/wildcard.crt'),
+        key: fs.readFileSync('/etc/ssl/rahul-arcisai-hsm/wildcard.key'),
+        ca: fs.readFileSync('/etc/ssl/rahul-arcisai-hsm/ca-chain.pem'),
+        rejectUnauthorized: false,
+    });
+}
+
+function closeMqtt(rollout) {
+    if (rollout.watchdog) { clearTimeout(rollout.watchdog); rollout.watchdog = null; }
+    if (rollout.mqttClient) {
+        try { rollout.mqttClient.end(true); } catch {}
+        rollout.mqttClient = null;
+    }
+}
+
+function pushHistory(rollout, entry) {
+    rollout.history.push({
+        at: new Date().toISOString(),
+        attempt: rollout.attempt,
+        ...entry,
+    });
+}
+
+function markTerminal(rollout, finalStatus, reason) {
+    rollout.status = finalStatus;
+    if (reason) rollout.failureReason = reason;
+    rollout.endedAt = new Date().toISOString();
+    pushHistory(rollout, { status: finalStatus, reason: reason || null });
+    closeMqtt(rollout);
+    setTimeout(() => {
+        if (otaRollouts.get(rollout.deviceId) === rollout) otaRollouts.delete(rollout.deviceId);
+    }, EVICT_AFTER_TERMINAL_MS);
+}
+
+function resetWatchdog(rollout) {
+    if (rollout.watchdog) clearTimeout(rollout.watchdog);
+    rollout.watchdog = setTimeout(() => {
+        scheduleRetry(rollout, 'no response within 5 minutes');
+    }, WATCHDOG_MS);
+}
+
+function scheduleRetry(rollout, reason) {
+    closeMqtt(rollout);
+    pushHistory(rollout, { status: 'attempt-failed', reason });
+    if (rollout.attempt >= MAX_ATTEMPTS) {
+        return markTerminal(rollout, 'failed', `${reason} (after ${rollout.attempt} attempt${rollout.attempt > 1 ? 's' : ''})`);
+    }
+    rollout.status = 'retrying';
+    setTimeout(() => startAttempt(rollout), RETRY_BACKOFF_MS);
+}
+
+// Map every camera reply into a rollout state transition. Any `error` state
+// retries (no detail-based classification). `upgrading` is terminal success.
+function handleCameraMessage(rollout, raw) {
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { parsed = { raw }; }
+
+    const state = parsed.state || parsed.status || parsed.level || 'unknown';
+    const detail = parsed.detail || parsed.message || parsed.error || '';
+
+    rollout.lastMessage = { state, detail, at: new Date().toISOString() };
+    pushHistory(rollout, { status: state, detail });
+
+    if (state === 'upgrading') {
+        return markTerminal(rollout, 'upgrading');
+    }
+    if (state === 'downloaded' || state === 'verified') {
+        rollout.status = state;
+        resetWatchdog(rollout);
+        return;
+    }
+    if (state === 'error') {
+        return scheduleRetry(rollout, detail || 'camera reported error');
+    }
+    // Unknown payload — keep listening; watchdog will catch silence.
+    console.log(`[secureOta] ${rollout.deviceId} unhandled state=${state} detail=${detail}`);
+}
+
+function startAttempt(rollout) {
+    rollout.attempt += 1;
+    rollout.status = 'publishing';
+    rollout.attemptStartedAt = new Date().toISOString();
+    pushHistory(rollout, { status: 'publishing' });
+
+    const client = newOtaMqttClient();
+    rollout.mqttClient = client;
+
+    const rxTopic = `${appTopicReceive}${rollout.deviceId}/62`;
+    const txTopic = `${appTopicSend}${rollout.deviceId}/62`;
+
+    client.on('connect', () => {
+        client.subscribe(rxTopic, (err) => {
+            if (err) return scheduleRetry(rollout, `subscribe error: ${err.message}`);
+            client.publish(txTopic, JSON.stringify(rollout.payload), { qos: 1 }, (pubErr) => {
+                if (pubErr) return scheduleRetry(rollout, `publish error: ${pubErr.message}`);
+                console.log(`[secureOta] ${rollout.deviceId} attempt ${rollout.attempt} published tag=${rollout.tag}`);
+                rollout.status = 'waiting';
+                pushHistory(rollout, { status: 'waiting' });
+                resetWatchdog(rollout);
+            });
+        });
+    });
+
+    client.on('message', (_topic, message) => handleCameraMessage(rollout, message.toString()));
+
+    client.on('error', (err) => {
+        console.error(`[secureOta] ${rollout.deviceId} MQTT error:`, err.message);
+        scheduleRetry(rollout, `mqtt error: ${err.message}`);
+    });
+}
+
+// @desc    Trigger secure OTA upgrade on a device via MQTT channel 62.
+//          Auto-retries once (total 2 attempts) on any camera-reported error
+//          or 5 minutes of silence. Returns 202 immediately with a rolloutId
+//          that the UI polls via /secureOta/status for live progress.
+// @route   POST /api/ota/secureOta
+// @body    { deviceId, tag? }   tag defaults to the latest release for the camera's productType
+// @access  mTLS (no JWT — nginx's ssl_verify_client is the gate)
+exports.secureOta = async (req, res) => {
+    const { deviceId } = req.body;
+    let { tag } = req.body;
+
+    if (!deviceId) {
+        return res.status(400).json({ success: false, message: 'deviceId is required' });
+    }
+
+    // Duplicate-click guard: re-attach UI to the existing rollout instead of
+    // firing a parallel one.
+    const existing = otaRollouts.get(deviceId);
+    if (existing && !['upgrading', 'failed'].includes(existing.status)) {
+        return res.status(409).json({
+            success: true,
+            message: 'Rollout already in progress',
+            rolloutId: existing.rolloutId,
+            deviceId: existing.deviceId,
+            tag: existing.tag,
+            status: existing.status,
+            attempt: existing.attempt,
+            maxAttempts: MAX_ATTEMPTS,
+            lastMessage: existing.lastMessage,
+        });
+    }
+
+    try {
+        const device = await p2predirect.findOne({ deviceId });
+        if (!device) {
+            return res.status(404).json({ success: false, message: `Camera ${deviceId} not found` });
+        }
+        if (!device.otaDeviceToken) {
+            return res.status(400).json({
+                success: false,
+                message: `OTA device token not registered for ${deviceId}. Save it via /api/camera/ota-token.`,
+            });
+        }
+
+        if (!tag) {
+            const latest = pickLatestManifest(listReleaseManifests(), device.productType);
+            if (!latest) {
+                return res.status(404).json({
+                    success: false,
+                    message: `No releases available for productType ${device.productType}`,
+                });
+            }
+            tag = latest.tag;
+        }
+
+        let manifest;
+        try { manifest = readReleaseManifest(tag); }
+        catch (err) { return res.status(404).json({ success: false, message: err.message }); }
+
+        const otaUrl = `${FIRMWARE_PUBLIC_BASE}/${tag}/${manifest.file}`;
+        const payload = {
+            url: otaUrl,
+            sha256: manifest.sha256,
+            deviceToken: device.otaDeviceToken,
+        };
+
+        const rollout = {
+            rolloutId: crypto.randomUUID(),
+            deviceId,
+            tag,
+            url: otaUrl,
+            sha256: manifest.sha256,
+            payload,
+            attempt: 0,
+            maxAttempts: MAX_ATTEMPTS,
+            status: 'pending',
+            lastMessage: null,
+            failureReason: null,
+            history: [],
+            startedAt: new Date().toISOString(),
+            endedAt: null,
+            mqttClient: null,
+            watchdog: null,
+        };
+        otaRollouts.set(deviceId, rollout);
+        startAttempt(rollout);
+
+        return res.status(202).json({
+            success: true,
+            message: 'Secure OTA triggered',
+            rolloutId: rollout.rolloutId,
+            deviceId,
+            tag,
+            url: otaUrl,
+            sha256: manifest.sha256,
+            status: rollout.status,
+            attempt: rollout.attempt,
+            maxAttempts: MAX_ATTEMPTS,
+        });
+    } catch (error) {
+        console.error('[secureOta] error:', error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// @desc    Poll the latest secure-OTA rollout for a device.
+// @route   GET /api/ota/secureOta/status?deviceId=...
+// @access  mTLS
+exports.getRolloutStatus = (req, res) => {
+    const { deviceId } = req.query;
+    if (!deviceId) return res.status(400).json({ success: false, message: 'deviceId is required' });
+
+    const rollout = otaRollouts.get(deviceId);
+    if (!rollout) return res.status(404).json({ success: false, message: 'No rollout found for this device' });
+
+    return res.status(200).json({
+        success: true,
+        rolloutId: rollout.rolloutId,
+        deviceId: rollout.deviceId,
+        tag: rollout.tag,
+        status: rollout.status,
+        attempt: rollout.attempt,
+        maxAttempts: rollout.maxAttempts,
+        lastMessage: rollout.lastMessage,
+        failureReason: rollout.failureReason,
+        startedAt: rollout.startedAt,
+        endedAt: rollout.endedAt,
+        history: rollout.history,
+    });
+};
+
+// @desc    Check whether a newer firmware release is available for a device
+// @route   GET /api/ota/checkUpdate?deviceId=...
+// @access  Authenticated
+exports.checkUpdate = async (req, res) => {
+    const { deviceId } = req.query;
+
+    if (!deviceId) {
+        return res.status(400).json({ success: false, message: 'deviceId is required' });
+    }
+
+    try {
+        const device = await p2predirect.findOne({ deviceId });
+        if (!device) {
+            return res.status(404).json({ success: false, message: `Camera ${deviceId} not found` });
+        }
+
+        const firmwareDoc = await Firmware.findOne({ deviceId });
+        const current = firmwareDoc?.currentFirmware || firmwareDoc?.firmware || null;
+
+        const latest = pickLatestManifest(listReleaseManifests(), device.productType);
+        if (!latest) {
+            return res.status(200).json({
+                success: true,
+                deviceId,
+                productType: device.productType,
+                current,
+                latest: null,
+                updateAvailable: false,
+                message: `No releases available for productType ${device.productType}`,
+            });
+        }
+
+        const updateAvailable = Boolean(current) && current !== latest.tag && current !== latest.file;
+
+        return res.status(200).json({
+            success: true,
+            deviceId,
+            productType: device.productType,
+            current,
+            latest: {
+                tag: latest.tag,
+                file: latest.file,
+                sha256: latest.sha256,
+                publishedAt: latest.publishedAt || null,
+                releaseNotes: latest.releaseNotes || null,
+            },
+            updateAvailable: updateAvailable || !current,
+            tokenRegistered: Boolean(device.otaDeviceToken),
+        });
+    } catch (error) {
+        console.error('[checkUpdate] error:', error);
+        return res.status(500).json({ success: false, message: error.message });
     }
 };
 
