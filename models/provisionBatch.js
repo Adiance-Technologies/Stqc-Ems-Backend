@@ -26,9 +26,10 @@ const provisionBatchSchema = new mongoose.Schema({
         required: true,
         enum: ['SECOS', 'AUGEN', '4GBDP', 'WFBDP'],
     },
+    // SKU. Present for ERP batches (model comes from the IWON) and blank for the
+    // manual operator flow, which only supplies family + firmware.
     productModel: {
         type: String,
-        required: true,
     },
     firmwareVersion: {
         type: String,

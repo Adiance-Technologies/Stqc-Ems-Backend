@@ -7,6 +7,7 @@ const ProvisionedDevice = require('../models/provisionedDevice');
 const ProductModel = require('../models/productModel');
 const batchGenerationService = require('../services/batchGenerationService');
 const macAllocator = require('../services/macAllocator');
+const serialAllocator = require('../services/serialAllocator');
 
 // ── Constants ─────────────────────────────────────────────────
 const FAMILY_CODES = { SECOS: 0, AUGEN: 1, '4GBDP': 2, WFBDP: 3 };
@@ -73,31 +74,24 @@ function encodeDeviceIdUint32(serial, familyCode) {
 // ── POST /api/provision/batch ─────────────────────────────────
 // Create a batch: persist rows, spawn batch_generate.sh in background, return immediately.
 exports.createBatch = catchAsyncErrors(async (req, res) => {
+    // Manual operator flow. The model number now comes from ERP, so the dashboard
+    // only asks for IWON + family + firmware + count. Connection type defaults to
+    // Eth (single MAC) — dual-interface Eth+WiFi is an ERP-only, model-driven
+    // feature — and the device-ID range is auto-allocated per family.
     const {
         iwon,                  // accept either iwon or batchId — same field, different names
         batchId: bodyBatchId,
-        productModel,
         family,
         firmwareVersion,
-        connectionType,        // 'Eth' | 'WIFI' | '4G' — picked by operator from SKU's allowed list
         count,
-        startDeviceId,
-        endDeviceId,
     } = req.body;
 
     const iwonRaw = iwon || bodyBatchId;
 
-    // Validation — IWON is now required and supplied by production planning
-    if (!iwonRaw || !productModel || !family || !firmwareVersion || !connectionType || !count || !startDeviceId || !endDeviceId) {
+    if (!iwonRaw || !family || !firmwareVersion || !count) {
         return res.status(400).json({
             success: false,
-            message: 'iwon, productModel, family, firmwareVersion, connectionType, count, startDeviceId, endDeviceId are required',
-        });
-    }
-    if (!['Eth', 'WIFI', '4G'].includes(connectionType)) {
-        return res.status(400).json({
-            success: false,
-            message: `connectionType must be one of: Eth, WIFI, 4G`,
+            message: 'iwon, family, firmwareVersion, count are required',
         });
     }
 
@@ -109,8 +103,19 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
         });
     }
 
-    // Uniqueness pre-check (cheap fast-path; the unique index on the model
-    // is the actual guarantee — see provisionBatch.js).
+    if (!FAMILY_CODES.hasOwnProperty(family)) {
+        return res.status(400).json({
+            success: false,
+            message: `Invalid family. Must be one of: ${Object.keys(FAMILY_CODES).join(', ')}`,
+        });
+    }
+
+    const parsedCount = parseInt(count, 10);
+    if (!Number.isFinite(parsedCount) || parsedCount < 1 || parsedCount > 10000) {
+        return res.status(400).json({ success: false, message: 'count must be 1–10000' });
+    }
+
+    // Uniqueness pre-check (the unique index on batchId is the real guarantee).
     const dup = await ProvisionBatch.findOne({ batchId: iwonClean }).lean();
     if (dup) {
         return res.status(409).json({
@@ -118,31 +123,8 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
             message: `IWON "${iwonClean}" is already in use (batch created at ${dup.createdAt}). IWON numbers must be unique.`,
         });
     }
-    if (!FAMILY_CODES.hasOwnProperty(family)) {
-        return res.status(400).json({
-            success: false,
-            message: `Invalid family. Must be one of: ${Object.keys(FAMILY_CODES).join(', ')}`,
-        });
-    }
-    const parsedCount = parseInt(count, 10);
-    if (!Number.isFinite(parsedCount) || parsedCount < 1 || parsedCount > 10000) {
-        return res.status(400).json({ success: false, message: 'count must be 1–10000' });
-    }
 
-    let range;
-    try {
-        range = parseDeviceIdRange(startDeviceId, endDeviceId);
-    } catch (e) {
-        return res.status(400).json({ success: false, message: e.message });
-    }
-    if (range.end - range.start + 1 !== parsedCount) {
-        return res.status(400).json({
-            success: false,
-            message: `Range size (${range.end - range.start + 1}) must equal count (${parsedCount})`,
-        });
-    }
-
-    // Firmware must exist
+    // Firmware must exist on disk.
     const fwDir = path.join(FIRMWARE_ROOT, firmwareVersion);
     if (!fs.existsSync(fwDir) || !fs.statSync(fwDir).isDirectory()) {
         return res.status(400).json({
@@ -151,43 +133,12 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
         });
     }
 
-    // SKU must exist and support the chosen connectionType.
-    // macsPerDevice comes from the SKU (default 1).
-    const sku = await ProductModel.findOne({ sku: productModel.toUpperCase() }).lean();
-    if (!sku) {
-        return res.status(400).json({
-            success: false,
-            message: `productModel '${productModel}' not found in product_models. Run import-product-models.js or use POST /api/provision/admin/product-models.`,
-        });
-    }
-    if (Array.isArray(sku.connectionTypes) && sku.connectionTypes.length && !sku.connectionTypes.includes(connectionType)) {
-        return res.status(400).json({
-            success: false,
-            message: `SKU ${sku.sku} does not support connectionType '${connectionType}'. Allowed: ${sku.connectionTypes.join(', ')}`,
-        });
-    }
-
-    // Range collision check
-    const overlap = await ProvisionedDevice.findOne({
-        family,
-        serialNumber: { $gte: range.start, $lte: range.end },
-    });
-    if (overlap) {
-        return res.status(409).json({
-            success: false,
-            message: `Serial range overlaps existing device ${overlap.deviceId}`,
-        });
-    }
-
-    // One MAC per MAC-bearing interface the SKU supports (Eth/WiFi). 4G never
-    // gets a MAC, so e.g. a 4G+Eth model gets only an Eth MAC. The operator-
-    // selected connectionType is the "primary"/requested one.
-    const macTypes = macAllocator.macBearingTypes(sku.connectionTypes);
-    if (!macTypes.length) {
-        return res.status(400).json({
-            success: false,
-            message: `SKU ${sku.sku} has no Eth/WiFi interface to assign a MAC (connectionTypes: ${(sku.connectionTypes || []).join(', ') || 'none'})`,
-        });
+    // Auto-allocate the device-ID range for this family (no operator range input).
+    let range;
+    try {
+        range = await serialAllocator.allocateRange(family, parsedCount);
+    } catch (e) {
+        return res.status(e.statusCode || 500).json({ success: false, message: e.message });
     }
 
     let batch;
@@ -195,15 +146,15 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
         ({ batch } = await provisionSingleModelBatch({
             batchId: iwonClean,
             iwonName: iwonClean,
-            productModel,
+            productModel: '',          // no SKU in the manual flow
             family,
             firmwareVersion,
             fwDir,
-            connectionType,
-            macTypes,
+            connectionType: 'Eth',     // default; dual-MAC is ERP/model-driven only
+            macTypes: ['Eth'],
             count: parsedCount,
-            serialStart: range.start,
-            serialEnd: range.end,
+            serialStart: range.serialStart,
+            serialEnd: range.serialEnd,
             createdBy: req.user ? req.user.email : 'system',
             source: 'ui',
         }));
@@ -225,12 +176,11 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
         status: 'generating',
         message: 'Batch generation started. Poll GET /api/provision/batch/:batchId for status.',
         count: parsedCount,
-        productModel,
         family,
         firmwareVersion,
-        startDeviceId,
-        endDeviceId,
-        macTypes,
+        startDeviceId: range.startDeviceId,
+        endDeviceId: range.endDeviceId,
+        connectionType: 'Eth',
         hsmKeyRef: HSM_KEY_REF,
         rootCaHash: ROOT_CA_HASH,
         rotpkHex: ROTPK_HEX,

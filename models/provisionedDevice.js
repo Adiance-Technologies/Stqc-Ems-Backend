@@ -21,9 +21,9 @@ const provisionedDeviceSchema = new mongoose.Schema({
         required: true,
         match: [/^(SECOS|AUGEN|4GBDP|WFBDP)$/, 'Suffix must be one of SECOS / AUGEN / 4GBDP / WFBDP'],
     },
+    // SKU — present for ERP batches, blank for the manual (family+firmware) flow.
     productModel: {
         type: String,
-        required: true,
     },
     family: {
         type: String,
