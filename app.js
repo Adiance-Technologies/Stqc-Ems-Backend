@@ -14,6 +14,8 @@ const otaRutes = require('./routes/otaRoutes');
 // so EMS serves the full provisioning/cert/station surface again.
 const provisioningRoutes = require('./routes/provisioningRoutes');
 const v2Routes = require('./routes/v2Routes');
+// ERP → EMS manufacturing bridge: POST /api/createBatch (token-gated).
+const erpRoutes = require('./routes/erpRoutes');
 const mqttService = require('./services/mqttService');
 //const supportRoutes = require('./routes/supportRoutes');
 //const batchRoutes = require('./routes/batchRoutes');
@@ -104,6 +106,8 @@ app.use('/api/ota', otaRutes);
 // Provisioning + v2 station endpoints — folded back in from MPS.
 app.use('/api/provision', provisioningRoutes);
 app.use('/api/v2', v2Routes);
+// ERP manufacturing bridge — POST /api/createBatch (token-gated, no JWT).
+app.use('/api', erpRoutes);
 //app.use('/api/support', supportRoutes);
 //app.use('/api/production', batchRoutes);
 //app.use('/api/stqc', stqcUserRoutes);

@@ -1,0 +1,56 @@
+name: Deploy EMS Backend
+
+# Deploys the Node/Express EMS backend to the platform server over SSH on every
+# push to main. There is NO build step (plain Node — no bundling), so the runner
+# just SSHes in, fast-forwards the checkout to origin/main, runs `npm install`
+# only when the dependency manifest changed, and restarts the systemd service.
+# (The frontend repo builds its CRA bundle on the runner; this backend does not.)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ems-backend-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pinned host key for 34.100.143.36 (same key the frontend workflow pins).
+          printf '%s\n' "34.100.143.36 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8mMBhesinuITc/TqFhTSStViL8PFGswAk3fc8fGcCl" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy (fast-forward + conditional npm install + restart)
+        env:
+          DEPLOY: root@34.100.143.36
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          $SSH "$DEPLOY" 'bash -se' <<'REMOTE'
+            set -euo pipefail
+            cd /home/rahul/Stqc-Ems-Backend
+            BEFORE=$(git rev-parse HEAD)
+            git fetch --prune origin
+            git reset --hard origin/main
+            AFTER=$(git rev-parse HEAD)
+            # Only reinstall deps when package.json / lockfile actually changed.
+            if ! git diff --quiet "$BEFORE" "$AFTER" -- package.json package-lock.json; then
+              echo "dependency manifest changed -> npm install --omit=dev"
+              npm install --omit=dev
+            else
+              echo "dependency manifest unchanged -> skipping npm install"
+            fi
+            systemctl restart ems-backend
+            sleep 3
+            systemctl is-active ems-backend
+            echo "deployed: $AFTER"
+          REMOTE

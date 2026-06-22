@@ -20,6 +20,19 @@
 
 const MacPool = require('../models/macPool');
 
+// Interfaces that actually consume a MAC from the pool. 4G/cellular is
+// identified by SIM/IMEI, not a MAC, so a 4G interface is never allocated one —
+// e.g. a model that supports both 4G and Eth gets only an Eth MAC.
+const MAC_BEARING_TYPES = ['Eth', 'WIFI'];
+
+// Given a SKU's connectionTypes, return just the ones that need a MAC, in a
+// stable order (Eth before WIFI). Drops 4G. Returns [] if the model has no
+// MAC-bearing interface (caller decides how to handle that edge case).
+function macBearingTypes(connectionTypes) {
+    const set = new Set(Array.isArray(connectionTypes) ? connectionTypes : []);
+    return MAC_BEARING_TYPES.filter(t => set.has(t));
+}
+
 // Format hex (12 char) → "80:77:86:50:00:01" for display / mac.txt
 function formatMac(hex12) {
     if (!hex12 || hex12.length !== 12) return null;
@@ -117,6 +130,92 @@ async function allocateForBatch({ batchId, deviceIds, connectionType, macsPerDev
     }
 }
 
+// Allocate one MAC of EACH requested type for every device. Used for
+// dual-interface SKUs (e.g. Eth+WiFi) where a single device needs a separate
+// MAC per interface, kept distinct so the station can burn each to the right
+// NIC. `types` is the SKU's full connectionTypes list (e.g. ['Eth','WIFI']);
+// pass a single-element list for ordinary one-interface devices.
+//
+// Returns Map<deviceId, [{ type, mac }]>  (mac = 12-char hex, un-formatted).
+// All-or-nothing: any failure releases every MAC claimed in this call.
+async function allocateMultiTypeForBatch({ batchId, deviceIds, types }) {
+    if (!batchId || !Array.isArray(deviceIds) || !deviceIds.length) {
+        throw new Error('allocateMultiTypeForBatch: batchId and deviceIds[] required');
+    }
+    if (!Array.isArray(types) || !types.length) {
+        throw new Error('allocateMultiTypeForBatch: types[] required');
+    }
+    for (const t of types) {
+        if (!['Eth', 'WIFI', '4G'].includes(t)) {
+            throw new Error(`allocateMultiTypeForBatch: unsupported type '${t}'`);
+        }
+    }
+
+    // Pre-flight per type so we 409 fast. Each type draws from its typed rows
+    // PLUS the shared typeless pool, so a device needing both Eth and WiFi pulls
+    // each from that same fungible pool — count per type independently against
+    // the per-device demand. (See macAllocator pickOne fallback behavior.)
+    const perType = {};
+    for (const t of types) perType[t] = (perType[t] || 0) + 1;
+    const need = {};
+    for (const t of types) need[t] = deviceIds.length;   // one of each type per device
+    for (const t of Object.keys(need)) {
+        const avail = await MacPool.countDocuments({
+            status: 'available',
+            $or: [{ type: t }, { type: null }],
+        });
+        if (avail < need[t]) {
+            const err = new Error(`Insufficient ${t} MACs in pool: need ${need[t]}, have ${avail}`);
+            err.code = 'MAC_POOL_EXHAUSTED';
+            err.statusCode = 409;
+            throw err;
+        }
+    }
+
+    const assignment = new Map();   // deviceId → [{type, mac}]
+    const claimedHexes = [];        // flat list for rollback
+
+    try {
+        for (const deviceId of deviceIds) {
+            const entries = [];
+            const hexes = [];
+            for (const t of types) {
+                const row = await pickOne(t);
+                if (!row) {
+                    const err = new Error(
+                        `Pool drained mid-allocation (claimed ${claimedHexes.length})`
+                    );
+                    err.code = 'MAC_POOL_RACE';
+                    err.statusCode = 409;
+                    throw err;
+                }
+                entries.push({ type: t, mac: row.mac });
+                hexes.push(row.mac);
+                claimedHexes.push(row.mac);
+            }
+            assignment.set(deviceId, entries);
+
+            // Stamp deviceId + iwon on every MAC claimed for this device.
+            await MacPool.updateMany(
+                { mac: { $in: hexes } },
+                { $set: { deviceId, iwon: batchId } }
+            );
+        }
+        return assignment;
+    } catch (e) {
+        if (claimedHexes.length) {
+            await MacPool.updateMany(
+                { mac: { $in: claimedHexes } },
+                {
+                    $set: { status: 'available' },
+                    $unset: { deviceId: '', iwon: '', assignedAt: '' },
+                }
+            );
+        }
+        throw e;
+    }
+}
+
 async function releaseForBatch(batchId) {
     // Only releases 'assigned' rows — once a MAC is 'burned' it stays put.
     const r = await MacPool.updateMany(
@@ -141,7 +240,10 @@ async function markBurnedForDevice(deviceId, mac) {
 
 module.exports = {
     allocateForBatch,
+    allocateMultiTypeForBatch,
     releaseForBatch,
     markBurnedForDevice,
     formatMac,
+    macBearingTypes,
+    MAC_BEARING_TYPES,
 };

@@ -292,13 +292,19 @@ async function generateBatch({
         //    Format: one MAC per line, "TYPE COLON_FORMAT" (the station parses this).
         //      Eth   80:77:86:50:00:01
         //      WIFI  80:77:86:50:00:02
-        //    SHA256SUMS sweep below covers this file automatically, so the
-        //    HSM signature includes the MAC assignment — station can verify.
+        //    Each line carries its OWN interface type, so a dual-interface device
+        //    (Eth + WiFi) labels each MAC correctly. SHA256SUMS below covers this
+        //    file, so the HSM signature includes the MAC assignment.
+        //
+        //    macAssignment entries are {type, mac(hex)} objects. Legacy callers
+        //    may still pass bare hex strings — fall back to the batch connectionType.
         const macsForDevice = macAssignment instanceof Map ? (macAssignment.get(deviceId) || []) : [];
         if (macsForDevice.length) {
-            const macLines = macsForDevice.map(hex => {
+            const macLines = macsForDevice.map(entry => {
+                const hex = typeof entry === 'string' ? entry : entry.mac;
+                const type = typeof entry === 'string' ? (connectionType || 'Eth') : (entry.type || connectionType || 'Eth');
                 const colon = [0, 2, 4, 6, 8, 10].map(i => hex.slice(i, i + 2)).join(':').toUpperCase();
-                return `${connectionType || 'Eth'}\t${colon}`;
+                return `${type}\t${colon}`;
             });
             fs.writeFileSync(path.join(devDir, 'mac.txt'), macLines.join('\n') + '\n');
         }

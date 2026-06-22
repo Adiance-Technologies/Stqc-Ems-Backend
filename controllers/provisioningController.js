@@ -166,7 +166,6 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
             message: `SKU ${sku.sku} does not support connectionType '${connectionType}'. Allowed: ${sku.connectionTypes.join(', ')}`,
         });
     }
-    const macsPerDevice = sku.macsPerDevice || 1;
 
     // Range collision check
     const overlap = await ProvisionedDevice.findOne({
@@ -180,41 +179,125 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
         });
     }
 
-    const batchId = iwonClean;          // ← IWON is now the batch ID, verbatim
+    // One MAC per MAC-bearing interface the SKU supports (Eth/WiFi). 4G never
+    // gets a MAC, so e.g. a 4G+Eth model gets only an Eth MAC. The operator-
+    // selected connectionType is the "primary"/requested one.
+    const macTypes = macAllocator.macBearingTypes(sku.connectionTypes);
+    if (!macTypes.length) {
+        return res.status(400).json({
+            success: false,
+            message: `SKU ${sku.sku} has no Eth/WiFi interface to assign a MAC (connectionTypes: ${(sku.connectionTypes || []).join(', ') || 'none'})`,
+        });
+    }
+
+    let batch;
+    try {
+        ({ batch } = await provisionSingleModelBatch({
+            batchId: iwonClean,
+            iwonName: iwonClean,
+            productModel,
+            family,
+            firmwareVersion,
+            fwDir,
+            connectionType,
+            macTypes,
+            count: parsedCount,
+            serialStart: range.start,
+            serialEnd: range.end,
+            createdBy: req.user ? req.user.email : 'system',
+            source: 'ui',
+        }));
+    } catch (e) {
+        if (e.code === 'MAC_POOL_EXHAUSTED' || e.code === 'MAC_POOL_RACE') {
+            return res.status(e.statusCode || 409).json({ success: false, message: e.message, code: e.code });
+        }
+        if (e.code === 11000 || (e.name === 'MongoServerError' && /duplicate key/i.test(e.message))) {
+            return res.status(409).json({
+                success: false,
+                message: `IWON "${iwonClean}" is already in use. IWON numbers must be unique.`,
+            });
+        }
+        throw e;
+    }
+
+    res.status(202).json({
+        batchId: iwonClean,
+        status: 'generating',
+        message: 'Batch generation started. Poll GET /api/provision/batch/:batchId for status.',
+        count: parsedCount,
+        productModel,
+        family,
+        firmwareVersion,
+        startDeviceId,
+        endDeviceId,
+        macTypes,
+        hsmKeyRef: HSM_KEY_REF,
+        rootCaHash: ROOT_CA_HASH,
+        rotpkHex: ROTPK_HEX,
+    });
+});
+
+// ── Reusable batch core ───────────────────────────────────────
+// Given fully-resolved + validated inputs, allocate device rows + MACs, persist
+// the batch, and kick off background generation. Shared by the manual UI handler
+// (createBatch above) and the ERP bridge (controllers/erpBatchController.js) so
+// the two stay in lock-step. Throws on allocation/persist failure — MAC-pool
+// errors carry .code/.statusCode; duplicate batchId surfaces as E11000.
+//
+// `macTypes` is the SKU's full connection-type set: one MAC of each type is
+// allocated per device (dual-interface SKUs → Eth + WiFi, kept separate).
+// `onSettled(finalStatus)` (optional) runs after background generation finishes
+// ('ready' on success, 'failed' otherwise) — the ERP bridge uses it to fire the
+// per-IWON batch-done callback once every model's batch is ready.
+async function provisionSingleModelBatch({
+    batchId,
+    iwonName,
+    productModel,
+    family,
+    firmwareVersion,
+    fwDir,
+    connectionType,
+    macTypes,
+    count,
+    serialStart,
+    serialEnd,
+    createdBy,
+    source,
+    onSettled,
+}) {
     const familyCode = FAMILY_CODES[family];
+    // Allocate one MAC per MAC-bearing interface (Eth/WiFi). Callers pass an
+    // already-filtered macTypes; the fallback re-filters so a 4G connectionType
+    // can never slip through and claim a MAC.
+    const types = (Array.isArray(macTypes) && macTypes.length)
+        ? macTypes
+        : macAllocator.macBearingTypes([connectionType]);
+    if (!types.length) {
+        const err = new Error(`No MAC-bearing interface (Eth/WiFi) for ${productModel} — cannot allocate a MAC`);
+        err.statusCode = 400;
+        throw err;
+    }
 
     // Build the device-ID list first so the allocator can stamp deviceId
-    // onto each MAC row in mac_pool.
+    // onto each MAC row in mac_pool. Device ID format = ATPL-NNNNNN-FAMILY.
     const deviceIds = [];
-    for (let serial = range.start; serial <= range.end; serial++) {
+    for (let serial = serialStart; serial <= serialEnd; serial++) {
         deviceIds.push(`ATPL-${String(serial).padStart(6, '0')}-${family}`);
     }
 
-    // ── Atomically allocate MACs from the pool ───────────────────────
-    // All-or-nothing — if the pool can't satisfy the request, this throws
-    // before we've written anything to provisionBatch / provisionedDevice.
-    let macAssignment;   // Map<deviceId, [hex, ...]>
-    try {
-        macAssignment = await macAllocator.allocateForBatch({
-            batchId,
-            deviceIds,
-            connectionType,
-            macsPerDevice,
-        });
-    } catch (e) {
-        return res.status(e.statusCode || 500).json({
-            success: false,
-            message: e.message,
-            code: e.code,
-        });
-    }
+    // ── Atomically allocate MACs (one of each type per device) ───────
+    // All-or-nothing — throws (with statusCode) before anything is persisted.
+    const macAssignment = await macAllocator.allocateMultiTypeForBatch({
+        batchId,
+        deviceIds,
+        types,
+    });   // Map<deviceId, [{type, mac(hex)}, ...]>
 
-    // Allocate per-device rows (status=allocated). The batch generator will
-    // produce the actual certs/OTP on disk and we'll flip devices to 'provisioned'.
-    // Device ID format = ATPL-NNNNNN-FAMILY (matches unmodified gen_otp.py).
+    // Per-device rows (status=allocated). Generation flips them to 'provisioned'.
     const devices = deviceIds.map((deviceId, idx) => {
-        const serial = range.start + idx;
-        const macs = macAssignment.get(deviceId) || [];
+        const serial = serialStart + idx;
+        const entries = macAssignment.get(deviceId) || [];
+        const macs = entries.map(e => ({ type: e.type, mac: macAllocator.formatMac(e.mac) }));
         return {
             deviceId,
             batchId,
@@ -225,46 +308,42 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
             familyCode,
             otpEncoded: '0x' + encodeDeviceIdUint32(serial, familyCode).toString(16).toUpperCase().padStart(8, '0'),
             status: 'allocated',
+            macs,
             // Denormalized snapshot of the primary MAC for quick display.
-            // mac_pool is the source of truth — re-query it if you suspect drift.
-            metadata: { macAddress: macs[0] ? macAllocator.formatMac(macs[0]) : null },
+            // mac_pool / macs[] are the source of truth.
+            metadata: { macAddress: macs[0] ? macs[0].mac : null },
         };
     });
 
     // Persist batch + devices. The unique index on batchId is the real
-    // guarantee against IWON collisions — handle E11000 here in case two
-    // operators submit the same IWON between the pre-check and create.
+    // guarantee against collisions — caller maps E11000 to HTTP 409.
     let batch;
     try {
         batch = await ProvisionBatch.create({
             batchId,
+            iwonName: iwonName || batchId,
+            source: source || 'ui',
             family,
             productModel,
             firmwareVersion,
             firmwarePath: fwDir,
             connectionType,
-            macsPerDevice,
-            count: parsedCount,
-            startDeviceId,
-            endDeviceId,
-            serialStart: range.start,
-            serialEnd: range.end,
+            macTypes: types,
+            macsPerDevice: types.length,
+            count,
+            startDeviceId: `ATPL-${String(serialStart).padStart(6, '0')}`,
+            endDeviceId: `ATPL-${String(serialEnd).padStart(6, '0')}`,
+            serialStart,
+            serialEnd,
             hsmKeyRef: HSM_KEY_REF,
             rootCaHash: ROOT_CA_HASH,
             rotpkHex: ROTPK_HEX,
             status: 'generating',
-            createdBy: req.user ? req.user.email : 'system',
+            createdBy: createdBy || 'system',
         });
     } catch (e) {
-        // If batch persist fails, release the MACs we just claimed so the
-        // pool stays consistent.
+        // Release the MACs we just claimed so the pool stays consistent.
         await macAllocator.releaseForBatch(batchId).catch(() => {});
-        if (e.code === 11000 || (e.name === 'MongoServerError' && /duplicate key/i.test(e.message))) {
-            return res.status(409).json({
-                success: false,
-                message: `IWON "${batchId}" is already in use. IWON numbers must be unique.`,
-            });
-        }
         throw e;
     }
 
@@ -276,29 +355,28 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
         throw e;
     }
 
-    // Run batch generation in-process via the Node service. We do NOT
-    // shell out to batch_generate.sh anymore — cert issuance goes through
-    // @google-cloud/security-private-ca, manifest signing through
-    // @google-cloud/kms, no PKCS#11 / no gcloud CLI dependency.
+    // ── Background generation (fire-and-forget) ──────────────────────
+    // Cert issuance via @google-cloud/security-private-ca, manifest signing via
+    // @google-cloud/kms — no PKCS#11 / gcloud CLI. Caller has already returned
+    // 202 by the time this resolves; UI polls GET /api/provision/batch/:id.
     fs.mkdirSync(BATCH_OUTPUT_ROOT, { recursive: true });
     const logFile = path.join(BATCH_OUTPUT_ROOT, `${batchId}.log`);
     const logStream = fs.createWriteStream(logFile, { flags: 'w' });
     const onLog = (line) => logStream.write(line + '\n');
 
-    // Fire-and-forget. The HTTP response below has already returned 202
-    // by the time this resolves; UI polls /api/provision/batch/:id for status.
     setImmediate(async () => {
+        let finalStatus = 'failed';
         try {
             const result = await batchGenerationService.generateBatch({
                 batchId,
                 productModel,
                 family,
                 firmware: firmwareVersion,
-                count: parsedCount,
-                serialStart: range.start,
-                serialEnd: range.end,
-                deviceIds,    // pass the controller-allocated IDs so EMS Mongo + ZIP stay in sync
-                macAssignment, // Map<deviceId, [hex, ...]> — written into devices/<id>/mac.txt
+                count,
+                serialStart,
+                serialEnd,
+                deviceIds,    // controller-allocated IDs so EMS Mongo + ZIP stay in sync
+                macAssignment, // Map<deviceId, [{type, mac}]> — written into devices/<id>/mac.txt
                 connectionType,
                 onLog,
             });
@@ -313,10 +391,8 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
                 }
             );
 
-            // Persist per-device cert metadata that batchGenerationService
-            // produced. result.devices[] is in serial order — write cert hash,
-            // GCP CAS resource name, NotBefore/After back to each device row
-            // so the station / dashboard sees Cert=Issued instead of Pending.
+            // Persist per-device cert metadata so the station/dashboard sees
+            // Cert=Issued instead of Pending.
             if (Array.isArray(result.devices) && result.devices.length) {
                 const ops = result.devices.map((dev) => ({
                     updateOne: {
@@ -335,39 +411,33 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
                 }));
                 await ProvisionedDevice.bulkWrite(ops, { ordered: false });
             } else {
-                // Fallback if generateBatch didn't return per-device records
                 await ProvisionedDevice.updateMany({ batchId }, { status: 'provisioned' });
             }
+            finalStatus = 'ready';
         } catch (err) {
             onLog(`ERROR: ${err.stack || err.message}`);
             await ProvisionBatch.updateOne(
                 { batchId },
                 { status: 'failed', error: `batchGenerationService failed: ${err.message}. See ${logFile}` }
             );
-            // Generation failed before any device was burned — release MACs back to pool.
-            // (assigned-only release; if any row is somehow already 'burned', it stays put.)
+            // Generation failed before any burn — release MACs back to the pool.
             const released = await macAllocator.releaseForBatch(batchId).catch(() => 0);
             if (released) onLog(`Released ${released} MACs back to pool after batchGen failure.`);
+            finalStatus = 'failed';
         } finally {
             logStream.end();
+            if (typeof onSettled === 'function') {
+                try { await onSettled(finalStatus); } catch (e) { /* never let the hook crash the worker */ }
+            }
         }
     });
 
-    res.status(202).json({
-        batchId,
-        status: 'generating',
-        message: 'Batch generation started. Poll GET /api/provision/batch/:batchId for status.',
-        count: parsedCount,
-        productModel,
-        family,
-        firmwareVersion,
-        startDeviceId,
-        endDeviceId,
-        hsmKeyRef: HSM_KEY_REF,
-        rootCaHash: ROOT_CA_HASH,
-        rotpkHex: ROTPK_HEX,
-    });
-});
+    return { batch, deviceIds };
+}
+
+// Exposed so the ERP bridge can create per-model batches through the exact same
+// path as the manual UI handler.
+exports.provisionSingleModelBatch = provisionSingleModelBatch;
 
 // ── GET /api/provision/batch/:batchId ─────────────────────────
 exports.getBatchStatus = catchAsyncErrors(async (req, res) => {

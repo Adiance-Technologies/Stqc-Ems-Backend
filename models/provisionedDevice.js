@@ -73,6 +73,15 @@ const provisionedDeviceSchema = new mongoose.Schema({
         tlsHandshake: { type: String, enum: ['pass', 'fail', ''], default: '' },
         mtlsAuth: { type: String, enum: ['pass', 'fail', ''], default: '' },
     },
+    // All MACs assigned to this device, kept separate per interface. Single-
+    // interface devices have one entry; dual-interface devices (e.g. Eth+WiFi)
+    // have one entry per type. mac_pool is the source of truth — this is a
+    // denormalized snapshot for display + the ZIP's mac.txt.
+    macs: [{
+        _id: false,
+        type: { type: String, enum: ['Eth', 'WIFI', '4G'] },
+        mac: { type: String },   // colon-formatted, e.g. 80:77:86:50:00:01
+    }],
     metadata: {
         macAddress: { type: String },
         firmwareVersion: { type: String },

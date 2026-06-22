@@ -6,6 +6,21 @@ const provisionBatchSchema = new mongoose.Schema({
         required: true,
         unique: true,
     },
+    // Parent work order this batch belongs to. For manual UI batches this equals
+    // batchId (one batch == one IWON). For ERP-created batches an IWON can span
+    // multiple models, so each model becomes its own batch (batchId = IWON-SKU)
+    // while iwonName ties them together for grouping/lookup + the batch-done callback.
+    iwonName: {
+        type: String,
+        index: true,
+    },
+    // Where the batch originated: 'ui' = operator via the dashboard,
+    // 'erp' = auto-created from an ERP IWON via POST /api/createBatch.
+    source: {
+        type: String,
+        enum: ['ui', 'erp'],
+        default: 'ui',
+    },
     family: {
         type: String,
         required: true,
@@ -33,6 +48,14 @@ const provisionBatchSchema = new mongoose.Schema({
         default: 1,
         min: 1,
         max: 4,
+    },
+    // Every connection type a MAC was allocated for, per device. Usually one
+    // entry matching connectionType. For dual-interface SKUs (e.g. a model that
+    // supports Eth AND WiFi) this holds both — one MAC of each type is assigned
+    // per device regardless of which single connectionType the order requested.
+    macTypes: {
+        type: [{ type: String, enum: ['Eth', 'WIFI', '4G'] }],
+        default: undefined,
     },
     firmwarePath: {
         type: String,
@@ -103,6 +126,12 @@ const provisionBatchSchema = new mongoose.Schema({
     },
     createdBy: {
         type: String,
+    },
+    // Set once EMS has notified ERP (POST /api/request/batch-done) that the
+    // parent IWON's batches are all done. Guards against double-sending the
+    // single per-IWON callback when several per-model batches finish together.
+    batchDoneSentAt: {
+        type: Date,
     },
 }, {
     timestamps: true,
