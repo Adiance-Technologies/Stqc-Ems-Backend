@@ -232,6 +232,36 @@ async function logStage(station, dev, stage, ok, message, payload) {
     }).catch(() => {});
 }
 
+// ── GET /api/provision/station/batches ─────────────────────────────────
+// Loadable batches for the station's "pick a batch" dropdown — so operators
+// select instead of typing the batchId. Only batches that have been generated
+// (ready / in_progress / completed) are returned; newest first.
+exports.listStationBatches = catchAsyncErrors(async (req, res) => {
+    const batches = await ProvisionBatch.find({ status: { $in: ['ready', 'in_progress', 'completed'] } })
+        .sort('-createdAt')
+        .limit(200)
+        .lean();
+
+    const results = await Promise.all(batches.map(async (b) => {
+        const counts = { provisioned: 0, reserved: 0, burning: 0, verified: 0, failed: 0 };
+        const devs = await ProvisionedDevice.find({ batchId: b.batchId }).select('status').lean();
+        devs.forEach(d => { if (counts[d.status] !== undefined) counts[d.status]++; });
+        return {
+            batchId:        b.batchId,
+            iwonName:       b.iwonName || null,
+            productModel:   b.productModel || null,
+            family:         b.family,
+            connectionType: b.connectionType || null,
+            status:         b.status,
+            count:          b.count,
+            counts,
+            createdAt:      b.createdAt,
+        };
+    }));
+
+    res.json({ ok: true, batches: results });
+});
+
 // ── GET /api/provision/station/batch/:batchId/devices?station=XYZ ──────
 // What devices does this batch hold for THIS station — separated by
 // status so the jig UI can show counts at a glance.

@@ -25,6 +25,7 @@ const {
     releaseDevice,
     startBurn,
     reportStage,
+    listStationBatches,
     listStationDevices,
     recordActivity,
     getStationActivity,
@@ -65,6 +66,7 @@ router.get('/admin/activity',       isAuthenticatedUser, authorizeRoles('admin')
 // ── Station endpoints (replace station-side Mongo) ────────────
 // Stations call these via mTLS + Bearer STATION_API_KEY. Admins (cookie
 // auth) can also hit them for ops/debug from the MPS UI.
+router.get( '/station/batches',                    stationOrUser, listStationBatches);
 router.post('/station/batch/:batchId/reserve',     stationOrUser, reserveDevices);
 router.post('/station/device/:deviceId/release',   stationOrUser, releaseDevice);
 router.post('/station/device/:deviceId/start-burn',stationOrUser, startBurn);
