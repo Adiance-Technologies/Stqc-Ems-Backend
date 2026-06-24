@@ -4,3 +4,4 @@
 /pdfs/requirement/quotation/default
 /batch_output
 *.save
+/firmware_cache

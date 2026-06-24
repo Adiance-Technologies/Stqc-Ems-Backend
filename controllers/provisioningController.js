@@ -8,6 +8,7 @@ const ProductModel = require('../models/productModel');
 const batchGenerationService = require('../services/batchGenerationService');
 const macAllocator = require('../services/macAllocator');
 const serialAllocator = require('../services/serialAllocator');
+const firmwareSource = require('../services/firmwareSource');
 
 // ── Constants ─────────────────────────────────────────────────
 const FAMILY_CODES = { SECOS: 0, AUGEN: 1, '4GBDP': 2, WFBDP: 3 };
@@ -124,14 +125,13 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
         });
     }
 
-    // Firmware must exist on disk.
-    const fwDir = path.join(FIRMWARE_ROOT, firmwareVersion);
-    if (!fs.existsSync(fwDir) || !fs.statSync(fwDir).isDirectory()) {
-        return res.status(400).json({
-            success: false,
-            message: `Firmware '${firmwareVersion}' not found under ${FIRMWARE_ROOT}`,
-        });
+    // Firmware version must be a real GitHub release (with a .bin + .rom).
+    try {
+        await firmwareSource.resolveRelease(firmwareVersion);
+    } catch (e) {
+        return res.status(e.statusCode || 400).json({ success: false, message: e.message });
     }
+    const fwDir = `github:${process.env.FIRMWARE_GH_REPO || 'Adiance-STQC/arcisai-app'}@${firmwareVersion}`;
 
     // Auto-allocate the device-ID range for this family (no operator range input).
     let range;
@@ -472,20 +472,19 @@ exports.downloadBatch = catchAsyncErrors(async (req, res) => {
 });
 
 // ── GET /api/provision/firmwares ──────────────────────────────
+// Firmware versions come from GitHub Releases (Adiance-STQC/arcisai-app), not a
+// local dir. Each release = a version with one .bin + one .rom; we surface the
+// .bin only (the file shown in the UI + flashed by PPC), keeping both in the ZIP.
 exports.listFirmwares = catchAsyncErrors(async (req, res) => {
-    if (!fs.existsSync(FIRMWARE_ROOT)) {
-        return res.json({ firmwares: [], firmwareRoot: FIRMWARE_ROOT });
-    }
-    const entries = fs.readdirSync(FIRMWARE_ROOT, { withFileTypes: true })
-        .filter(e => e.isDirectory())
-        .map(e => {
-            const dir = path.join(FIRMWARE_ROOT, e.name);
-            const files = fs.readdirSync(dir).filter(f => f.endsWith('.rom') || f.endsWith('.bin'));
-            return { version: e.name, files };
-        })
-        .sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }));
-
-    res.json({ firmwares: entries, firmwareRoot: FIRMWARE_ROOT });
+    const releases = await firmwareSource.listReleases();
+    const firmwares = releases.map(r => ({
+        version:     r.version,
+        files:       [r.bin.name],   // show the .bin only
+        bin:         r.bin.name,
+        rom:         r.rom.name,
+        publishedAt: r.publishedAt,
+    }));
+    res.json({ firmwares, source: process.env.FIRMWARE_GH_REPO || 'Adiance-STQC/arcisai-app' });
 });
 
 // ── POST /api/provision/verify ────────────────────────────────

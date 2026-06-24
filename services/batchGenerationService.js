@@ -23,6 +23,7 @@ const AdmZip   = require('adm-zip');
 const { KeyManagementServiceClient } = require('@google-cloud/kms');
 
 const certIssuance = require('./certIssuanceService');
+const firmwareSource = require('./firmwareSource');
 
 // ── Config ───────────────────────────────────────────────────────────
 const PROJECT     = process.env.GCP_PROJECT_ID || 'arcisai-iot-platform';
@@ -233,10 +234,11 @@ async function generateBatch({
     // ── Bundle pubkey ────────────────────────────────────────────────
     bundlePubkey(workDir, log);
 
-    // ── Copy firmware ────────────────────────────────────────────────
-    const fwSrc = path.join(FIRMWARE_ROOT, firmware);
-    if (!fs.existsSync(fwSrc)) throw new Error(`firmware dir not found: ${fwSrc}`);
-    copyDir(fwSrc, path.join(workDir, 'firmware'));
+    // ── Fetch firmware from GitHub Releases ──────────────────────────
+    // `firmware` is a release tag (e.g. v6.2.50.0-dev). Downloads BOTH the .bin
+    // (flashed by PPC / shown in UI) and .rom (kept as reference) into firmware/.
+    const fwDownload = await firmwareSource.downloadFirmware(firmware, path.join(workDir, 'firmware'));
+    log(`firmware ${firmware}: bin=${fwDownload.binName} rom=${fwDownload.romName}`);
     // firmware.sha256 manifest
     const fwLines = [];
     for (const f of fs.readdirSync(path.join(workDir, 'firmware'))) {

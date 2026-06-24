@@ -26,6 +26,7 @@ const ProductModel = require('../models/productModel');
 const PendingBatch = require('../models/pendingBatch');
 const macAllocator = require('../services/macAllocator');
 const serialAllocator = require('../services/serialAllocator');
+const firmwareSource = require('../services/firmwareSource');
 const { provisionSingleModelBatch } = require('./provisioningController');
 
 const FIRMWARE_ROOT = process.env.FIRMWARE_ROOT || '/home/rahul/augentix-mqtt/firmware';
@@ -150,7 +151,8 @@ exports.createFromPending = catchAsyncErrors(async (req, res) => {
 
         const firmwareVersion = (firmwares[item.modelNumber] || item.suggestedFirmware || '').trim();
         if (!firmwareVersion) { failed.push(`${label}: no firmware selected`); continue; }
-        if (!fwDirExists(firmwareVersion)) { failed.push(`${label}: firmware '${firmwareVersion}' not found`); continue; }
+        try { await firmwareSource.resolveRelease(firmwareVersion); }
+        catch (e) { failed.push(`${label}: ${e.message}`); continue; }
 
         let batchId = `${iwon}-${item.sku}`;
         let n = 1;
@@ -165,7 +167,7 @@ exports.createFromPending = catchAsyncErrors(async (req, res) => {
                 productModel: item.sku,
                 family: item.family,
                 firmwareVersion,
-                fwDir: path.join(FIRMWARE_ROOT, firmwareVersion),
+                fwDir: `github:${process.env.FIRMWARE_GH_REPO || 'Adiance-STQC/arcisai-app'}@${firmwareVersion}`,
                 connectionType: item.connectionType && item.macTypes.includes(item.connectionType) ? item.connectionType : item.macTypes[0],
                 macTypes: item.macTypes,
                 count: item.quantity,
