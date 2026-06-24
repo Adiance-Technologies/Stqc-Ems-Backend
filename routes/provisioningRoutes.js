@@ -24,6 +24,7 @@ const {
     reserveDevices,
     releaseDevice,
     startBurn,
+    reportStage,
     listStationDevices,
     recordActivity,
     getStationActivity,
@@ -67,6 +68,7 @@ router.get('/admin/activity',       isAuthenticatedUser, authorizeRoles('admin')
 router.post('/station/batch/:batchId/reserve',     stationOrUser, reserveDevices);
 router.post('/station/device/:deviceId/release',   stationOrUser, releaseDevice);
 router.post('/station/device/:deviceId/start-burn',stationOrUser, startBurn);
+router.post('/station/device/:deviceId/stage',     stationOrUser, reportStage);
 router.get( '/station/batch/:batchId/devices',     stationOrUser, listStationDevices);
 router.post('/station/activity',                   stationOrUser, recordActivity);
 router.get( '/station/activity',                   stationOrUser, getStationActivity);

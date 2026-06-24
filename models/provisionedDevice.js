@@ -102,6 +102,22 @@ const provisionedDeviceSchema = new mongoose.Schema({
     verifiedAt: {
         type: Date,
     },
+    // Granular per-device progress reported by the PPC station as it burns.
+    // Coarse `status` (above) stays the source of truth for lifecycle; these
+    // sub-stages give live visibility into the burn pipeline. certBurned/macBurned
+    // are schema-ready for when PPC implements those steps.
+    stages: {
+        started:    { done: { type: Boolean, default: false }, at: { type: Date } }, // batch pulled / provisioning started in PPC
+        efuse:      { done: { type: Boolean, default: false }, at: { type: Date } },
+        flash:      { done: { type: Boolean, default: false }, at: { type: Date } },
+        certBurned: { done: { type: Boolean, default: false }, at: { type: Date } },
+        macBurned:  { done: { type: Boolean, default: false }, at: { type: Date } },
+        completed:  { done: { type: Boolean, default: false }, at: { type: Date } },
+    },
+    // Last stage reported, for quick display (e.g. "efuse", "flash", "completed").
+    currentStage: {
+        type: String,
+    },
 }, {
     timestamps: true,
 });

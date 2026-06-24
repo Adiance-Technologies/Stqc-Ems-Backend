@@ -174,6 +174,64 @@ exports.startBurn = catchAsyncErrors(async (req, res) => {
     res.json({ ok: true, deviceId, status: dev.status });
 });
 
+// ── POST /api/provision/station/device/:deviceId/stage ─────────────────
+// Body: { station, stage, ok?, message?, payload? }
+// Granular burn-progress sync from the PPC station. Stamps stages.<stage> and
+// currentStage on the device so the dashboard shows live progress through the
+// pipeline. Coarse lifecycle (reserved→burning→verified) is unchanged — the
+// terminal "verified" transition (and MAC burn) stays in reportVerification.
+const VALID_STAGES = ['started', 'efuse', 'flash', 'certBurned', 'macBurned', 'completed'];
+exports.reportStage = catchAsyncErrors(async (req, res) => {
+    const { deviceId } = req.params;
+    const station = resolveStation(req);
+    const { stage, ok, message, payload } = req.body || {};
+
+    if (!station) return res.status(400).json({ success: false, message: 'station required' });
+    if (!stage || !VALID_STAGES.includes(stage)) {
+        return res.status(400).json({ success: false, message: `stage must be one of: ${VALID_STAGES.join(', ')}` });
+    }
+
+    const now = new Date();
+    const set = {
+        [`stages.${stage}.done`]: ok !== false,   // default true unless explicitly ok:false
+        [`stages.${stage}.at`]: now,
+        currentStage: stage,
+    };
+    // First real stage moves a reserved device into 'burning' so dashboards show
+    // it as actively in-progress (mirrors startBurn). Never downgrade a terminal
+    // device (verified/failed) — only nudge from reserved.
+    if (stage === 'started') {
+        const moved = await ProvisionedDevice.findOneAndUpdate(
+            { deviceId, status: 'reserved' },
+            { $set: { ...set, status: 'burning', 'metadata.burningAt': now } },
+            { new: true }
+        );
+        if (moved) {
+            await logStage(station, moved, stage, ok, message, payload);
+            return res.json({ ok: true, deviceId, stage, currentStage: moved.currentStage, status: moved.status });
+        }
+    }
+
+    const dev = await ProvisionedDevice.findOneAndUpdate(
+        { deviceId },
+        { $set: set },
+        { new: true }
+    );
+    if (!dev) return res.status(404).json({ success: false, message: `Device ${deviceId} not found` });
+
+    await logStage(station, dev, stage, ok, message, payload);
+    res.json({ ok: true, deviceId, stage, currentStage: dev.currentStage, status: dev.status });
+});
+
+async function logStage(station, dev, stage, ok, message, payload) {
+    await ProvisionActivity.create({
+        station, deviceId: dev.deviceId, batchId: dev.batchId, slot: dev.metadata?.jigSlot,
+        type: `stage:${stage}`,
+        message: message || `${stage}${ok === false ? ' FAILED' : ' done'}`,
+        payload,
+    }).catch(() => {});
+}
+
 // ── GET /api/provision/station/batch/:batchId/devices?station=XYZ ──────
 // What devices does this batch hold for THIS station — separated by
 // status so the jig UI can show counts at a glance.
