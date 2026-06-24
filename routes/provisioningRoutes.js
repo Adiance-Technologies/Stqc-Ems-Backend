@@ -16,6 +16,11 @@ const {
     getActivityFeed,
 } = require('../controllers/provisioningAdminController');
 const {
+    listPendingBatches,
+    createFromPending,
+    rejectPending,
+} = require('../controllers/erpBatchController');
+const {
     reserveDevices,
     releaseDevice,
     startBurn,
@@ -43,6 +48,11 @@ router.post('/verify',                stationOrUser, reportVerification);
 
 // ── Firmware catalog ──────────────────────────────────────────
 router.get('/firmwares', isAuthenticatedUser, listFirmwares);
+
+// ── Pending ERP IWONs (queued on accept; operator picks firmware → create) ──
+router.get('/pending', isAuthenticatedUser, authorizeRoles('admin'), listPendingBatches);
+router.post('/pending/:iwonName/create', isAuthenticatedUser, authorizeRoles('admin'), createFromPending);
+router.post('/pending/:iwonName/reject', isAuthenticatedUser, authorizeRoles('admin'), rejectPending);
 
 // ── Admin: SKU catalog + MAC pool management ──────────────────
 router.get('/admin/product-models', isAuthenticatedUser, authorizeRoles('admin'), listProductModels);

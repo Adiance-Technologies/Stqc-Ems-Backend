@@ -3,20 +3,18 @@
  *
  * ERP → EMS manufacturing bridge.
  *
- * The ERP (Adiance-Erp-ST) fires POST /api/createBatch when an IWON (work
- * order) is accepted. One IWON can span several camera models; EMS turns each
- * model into its own single-model provisioning batch (batchId = <IWON>-<SKU>),
- * all tagged with the same iwonName. When every batch for the IWON has finished
- * generating, EMS calls ERP back at POST /api/request/batch-done so the IWON
- * unblocks. Auth in BOTH directions is the shared ERP_BRIDGE_TOKEN.
+ * Flow: when ERP accepts an IWON it POSTs /api/createBatch. EMS does NOT generate
+ * immediately — firmware is an EMS-side decision. Instead EMS resolves the models
+ * and QUEUES the IWON as a pending request (models/pendingBatch.js). An operator
+ * opens it in the EMS dashboard, picks firmware per model, and triggers creation
+ * (POST /api/provision/pending/:iwonName/create), which generates one single-model
+ * ProvisionBatch per model (serials + MACs + certs + ZIP). When every batch for
+ * the IWON is ready, EMS calls ERP back at POST /api/request/batch-done.
  *
- * Inbound payload (see Adiance-Erp-ST utils/etaemsBatch.js):
+ * Inbound payload (Adiance-Erp-ST utils/etaemsBatch.js):
  *   { iwonName, totalQuantity, items: [{ modelNumber, connection, enclosure, quantity }] }
  *
- * Serials are auto-allocated (services/serialAllocator.js); MACs are allocated
- * one-per-supported-interface (dual-interface SKUs get Eth + WiFi). Both reuse
- * the exact same path as the manual UI handler via
- * provisioningController.provisionSingleModelBatch.
+ * Auth in both directions is the shared ERP_BRIDGE_TOKEN.
  */
 
 const fs = require('fs');
@@ -25,6 +23,7 @@ const axios = require('axios');
 const catchAsyncErrors = require('../middleware/catchAsyncErrors');
 const ProvisionBatch = require('../models/provisionBatch');
 const ProductModel = require('../models/productModel');
+const PendingBatch = require('../models/pendingBatch');
 const macAllocator = require('../services/macAllocator');
 const serialAllocator = require('../services/serialAllocator');
 const { provisionSingleModelBatch } = require('./provisioningController');
@@ -34,8 +33,7 @@ const ERP_BASE_URL = process.env.ERP_BASE_URL || 'http://127.0.0.1:5003';
 const ERP_BATCH_DONE_PATH = process.env.ERP_BATCH_DONE_PATH || '/api/request/batch-done';
 const ERP_NOTIFY_TIMEOUT_MS = 8000;
 
-// Map ERP's free-text connection label → EMS connectionType enum.
-// PoE is ethernet, so poe → Eth.
+// Map ERP's free-text connection label → EMS connectionType enum (PoE = Ethernet).
 function mapConnection(raw) {
     const k = String(raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     if (['poe', 'eth', 'ethernet', 'lan', 'rj45'].includes(k)) return 'Eth';
@@ -44,9 +42,16 @@ function mapConnection(raw) {
     return null;
 }
 
-// ── POST /api/createBatch ─────────────────────────────────────
+function fwDirExists(version) {
+    if (!version) return false;
+    const dir = path.join(FIRMWARE_ROOT, version);
+    return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+}
+
+// ── POST /api/createBatch (ERP) ───────────────────────────────
+// Register the IWON as a pending request for the EMS operator. No generation.
 exports.createErpBatch = catchAsyncErrors(async (req, res) => {
-    const { iwonName, items } = req.body || {};
+    const { iwonName, totalQuantity, items } = req.body || {};
 
     if (!iwonName || typeof iwonName !== 'string' || !iwonName.trim()) {
         return res.status(400).json({ success: false, message: 'iwonName is required' });
@@ -56,155 +61,180 @@ exports.createErpBatch = catchAsyncErrors(async (req, res) => {
     }
     const iwon = iwonName.trim();
 
-    // Idempotency / collision guard at the IWON level: if EMS already has
-    // batches for this IWON, don't create a second set.
-    const existing = await ProvisionBatch.findOne({ iwonName: iwon }).select('batchId').lean();
-    if (existing) {
-        return res.status(409).json({
-            success: false,
-            code: 'IWON_EXISTS',
-            message: `IWON '${iwon}' already has batches in EMS (e.g. ${existing.batchId})`,
-        });
+    // Already queued, or already generated? Don't double-register.
+    const dupPending = await PendingBatch.findOne({ iwonName: iwon, status: 'awaiting_firmware' }).lean();
+    if (dupPending) {
+        return res.status(409).json({ success: false, code: 'IWON_PENDING', message: `IWON '${iwon}' is already queued in EMS awaiting firmware.` });
+    }
+    const dupBatch = await ProvisionBatch.findOne({ iwonName: iwon }).select('batchId').lean();
+    if (dupBatch) {
+        return res.status(409).json({ success: false, code: 'IWON_EXISTS', message: `IWON '${iwon}' already has batches in EMS (e.g. ${dupBatch.batchId}).` });
     }
 
-    // Resolve + validate EVERY item before creating anything, so a bad item
-    // is reported rather than leaving a half-provisioned IWON.
-    const resolved = [];
-    const errors = [];
-    const usedBatchIds = new Set();
-
+    // Resolve each item against the catalog (no allocation). Per-item errors are
+    // recorded so the operator sees exactly which models need attention.
+    const resolvedItems = [];
     for (let i = 0; i < items.length; i++) {
         const it = items[i] || {};
         const modelNumber = String(it.modelNumber || '').trim();
         const qty = parseInt(it.quantity, 10);
-        const requested = mapConnection(it.connection);
+        const connectionType = mapConnection(it.connection);
 
-        if (!modelNumber) { errors.push(`item ${i}: modelNumber is required`); continue; }
-        if (!Number.isFinite(qty) || qty < 1) { errors.push(`item ${i} (${modelNumber}): quantity must be >= 1`); continue; }
+        const row = {
+            modelNumber,
+            connection: it.connection || '',
+            connectionType,
+            quantity: Number.isFinite(qty) ? qty : 0,
+        };
+
+        if (!modelNumber) { row.resolveError = 'modelNumber missing'; resolvedItems.push(row); continue; }
+        if (!Number.isFinite(qty) || qty < 1) { row.resolveError = 'quantity must be >= 1'; resolvedItems.push(row); continue; }
 
         const sku = await ProductModel.findOne({ sku: modelNumber.toUpperCase() }).lean();
-        if (!sku) { errors.push(`item ${i}: SKU '${modelNumber}' not found in product_models`); continue; }
-        if (!sku.family) { errors.push(`SKU ${sku.sku}: no family set in catalog`); continue; }
+        if (!sku) { row.resolveError = `SKU not found in product_models`; resolvedItems.push(row); continue; }
+        row.sku = sku.sku;
+        row.family = sku.family || null;
+        if (!sku.family) { row.resolveError = 'SKU has no family in catalog'; resolvedItems.push(row); continue; }
 
-        const firmwareVersion = sku.defaultFirmware;
-        if (!firmwareVersion) {
-            errors.push(`SKU ${sku.sku}: no defaultFirmware configured — set it before ERP can build this model`);
-            continue;
-        }
-        const fwDir = path.join(FIRMWARE_ROOT, firmwareVersion);
-        if (!fs.existsSync(fwDir) || !fs.statSync(fwDir).isDirectory()) {
-            errors.push(`SKU ${sku.sku}: firmware '${firmwareVersion}' not found under ${FIRMWARE_ROOT}`);
-            continue;
-        }
-
-        // One MAC per MAC-bearing interface (Eth/WiFi) the model supports. 4G
-        // never gets a MAC, so a 4G+Eth model gets only an Eth MAC; an Eth+WiFi
-        // model gets both. The requested connection becomes the primary
-        // connectionType when the model supports it.
         const macTypes = macAllocator.macBearingTypes(sku.connectionTypes);
-        if (!macTypes.length) {
-            errors.push(`SKU ${sku.sku}: no Eth/WiFi interface to assign a MAC (connectionTypes: ${(sku.connectionTypes || []).join(', ') || 'none'})`);
-            continue;
-        }
-        const connectionType = (requested && macTypes.includes(requested)) ? requested : macTypes[0];
+        if (!macTypes.length) { row.resolveError = 'SKU has no Eth/WiFi interface to assign a MAC'; resolvedItems.push(row); continue; }
+        row.macTypes = macTypes;
+        row.suggestedFirmware = sku.defaultFirmware || null;   // operator may override
+        resolvedItems.push(row);
+    }
 
-        // batchId = <IWON>-<SKU>; disambiguate if the same SKU appears twice.
-        let batchId = `${iwon}-${sku.sku}`;
+    const pending = await PendingBatch.create({
+        iwonName: iwon,
+        totalQuantity: Number(totalQuantity) || resolvedItems.reduce((s, r) => s + (r.quantity || 0), 0),
+        source: 'erp',
+        status: 'awaiting_firmware',
+        items: resolvedItems,
+    });
+
+    return res.status(202).json({
+        success: true,
+        iwonName: iwon,
+        queued: true,
+        message: `IWON '${iwon}' queued in EMS. An operator will choose firmware and create the batches.`,
+        items: resolvedItems.map(r => ({ modelNumber: r.modelNumber, sku: r.sku, family: r.family, quantity: r.quantity, macTypes: r.macTypes, suggestedFirmware: r.suggestedFirmware, resolveError: r.resolveError })),
+        pendingId: String(pending._id),
+    });
+});
+
+// ── GET /api/provision/pending (admin) ────────────────────────
+exports.listPendingBatches = catchAsyncErrors(async (req, res) => {
+    const pending = await PendingBatch.find({ status: 'awaiting_firmware' }).sort('-createdAt').lean();
+    res.json({ pending });
+});
+
+// ── POST /api/provision/pending/:iwonName/create (admin) ──────
+// Body: { firmwares: { "<modelNumber>": "<firmwareVersion>", ... } }
+// Generates one batch per resolvable model using the operator-chosen firmware.
+exports.createFromPending = catchAsyncErrors(async (req, res) => {
+    const iwon = String(req.params.iwonName || '').trim();
+    const firmwares = (req.body && req.body.firmwares) || {};
+
+    const pending = await PendingBatch.findOne({ iwonName: iwon });
+    if (!pending) return res.status(404).json({ success: false, message: `No pending IWON '${iwon}'` });
+    if (pending.status !== 'awaiting_firmware') {
+        return res.status(409).json({ success: false, message: `IWON '${iwon}' is '${pending.status}', not awaiting firmware` });
+    }
+
+    const created = [];
+    const failed = [];
+    const usedBatchIds = new Set();
+
+    for (const item of pending.items) {
+        const label = item.modelNumber || '(unknown)';
+        if (item.resolveError) { failed.push(`${label}: ${item.resolveError}`); continue; }
+
+        const firmwareVersion = (firmwares[item.modelNumber] || item.suggestedFirmware || '').trim();
+        if (!firmwareVersion) { failed.push(`${label}: no firmware selected`); continue; }
+        if (!fwDirExists(firmwareVersion)) { failed.push(`${label}: firmware '${firmwareVersion}' not found`); continue; }
+
+        let batchId = `${iwon}-${item.sku}`;
         let n = 1;
-        while (usedBatchIds.has(batchId)) { n++; batchId = `${iwon}-${sku.sku}-${n}`; }
+        while (usedBatchIds.has(batchId)) { n++; batchId = `${iwon}-${item.sku}-${n}`; }
         usedBatchIds.add(batchId);
 
-        resolved.push({ sku, family: sku.family, firmwareVersion, fwDir, connectionType, macTypes, quantity: qty, batchId });
-    }
-
-    if (!resolved.length) {
-        return res.status(400).json({ success: false, message: 'No valid items to provision', errors });
-    }
-
-    // Create each model's batch. Serial range is auto-allocated per family.
-    const created = [];
-    const failed = [...errors];
-    for (const r of resolved) {
         try {
-            const range = await serialAllocator.allocateRange(r.family, r.quantity);
+            const range = await serialAllocator.allocateRange(item.family, item.quantity);
             const { batch } = await provisionSingleModelBatch({
-                batchId: r.batchId,
+                batchId,
                 iwonName: iwon,
-                productModel: r.sku.sku,
-                family: r.family,
-                firmwareVersion: r.firmwareVersion,
-                fwDir: r.fwDir,
-                connectionType: r.connectionType,
-                macTypes: r.macTypes,
-                count: r.quantity,
+                productModel: item.sku,
+                family: item.family,
+                firmwareVersion,
+                fwDir: path.join(FIRMWARE_ROOT, firmwareVersion),
+                connectionType: item.connectionType && item.macTypes.includes(item.connectionType) ? item.connectionType : item.macTypes[0],
+                macTypes: item.macTypes,
+                count: item.quantity,
                 serialStart: range.serialStart,
                 serialEnd: range.serialEnd,
-                createdBy: `erp:${iwon}`,
+                createdBy: req.user ? req.user.email : 'operator',
                 source: 'erp',
-                // Fire the per-IWON batch-done callback once every model is ready.
                 onSettled: () => maybeNotifyErpDone(iwon),
             });
-            created.push({
-                batchId: batch.batchId,
-                model: r.sku.sku,
-                family: r.family,
-                count: r.quantity,
-                connectionType: r.connectionType,
-                macTypes: r.macTypes,
-                startDeviceId: range.startDeviceId,
-                endDeviceId: range.endDeviceId,
-            });
+            created.push({ batchId: batch.batchId, model: item.sku, family: item.family, count: item.quantity, firmwareVersion, macTypes: item.macTypes });
         } catch (e) {
-            failed.push(`${r.sku.sku}: ${e.message}`);
+            failed.push(`${item.sku}: ${e.message}`);
         }
     }
 
     if (!created.length) {
-        // Nothing provisioned — non-2xx so ERP logs it and leaves the IWON
-        // awaiting batch (an operator can fix the catalog and retry).
-        return res.status(502).json({ success: false, message: 'All items failed to provision', errors: failed });
+        return res.status(400).json({ success: false, message: 'No batches were created', failed });
     }
+
+    pending.status = 'created';
+    pending.createdBatchIds = created.map(c => c.batchId);
+    pending.createdBy = req.user ? req.user.email : 'operator';
+    pending.createdAt2 = new Date();
+    await pending.save();
 
     return res.status(202).json({
         success: true,
         iwonName: iwon,
         accepted: created,
         failed: failed.length ? failed : undefined,
-        message: `Provisioning ${created.length} batch(es) for ${iwon}. ERP will be notified at ${ERP_BATCH_DONE_PATH} when all are ready.`,
+        message: `Generating ${created.length} batch(es) for ${iwon}. ERP will be notified when all are ready.`,
     });
 });
 
-// Called after each per-model batch settles. Sends the single per-IWON
-// batch-done callback once ALL of the IWON's batches have finished generating
-// successfully (none still generating, none failed). Atomically claims the
-// send via batchDoneSentAt so concurrent settles don't double-fire.
+// ── POST /api/provision/pending/:iwonName/reject (admin) ──────
+exports.rejectPending = catchAsyncErrors(async (req, res) => {
+    const iwon = String(req.params.iwonName || '').trim();
+    const reason = (req.body && req.body.reason) || '';
+    const pending = await PendingBatch.findOne({ iwonName: iwon });
+    if (!pending) return res.status(404).json({ success: false, message: `No pending IWON '${iwon}'` });
+    if (pending.status !== 'awaiting_firmware') {
+        return res.status(409).json({ success: false, message: `IWON '${iwon}' is '${pending.status}', cannot reject` });
+    }
+    pending.status = 'rejected';
+    pending.rejectedReason = reason;
+    pending.rejectedAt = new Date();
+    await pending.save();
+    // Note: ERP is not notified (its batch-done only accepts "done"); the IWON
+    // stays "awaiting batch" in ERP for the operator to handle out-of-band.
+    res.json({ success: true, iwonName: iwon, status: 'rejected' });
+});
+
+// Fire the single per-IWON batch-done once all of the IWON's batches are ready.
 async function maybeNotifyErpDone(iwonName) {
     const batches = await ProvisionBatch.find({ iwonName }).select('status batchDoneSentAt').lean();
     if (!batches.length) return;
-
-    const stillWorking = batches.some(b => ['generating', 'allocated'].includes(b.status));
-    if (stillWorking) return;
-
-    const anyFailed = batches.some(b => b.status === 'failed');
-    if (anyFailed) {
-        // Leave the IWON unconfirmed for operator attention — ERP only accepts "done".
+    if (batches.some(b => ['generating', 'allocated'].includes(b.status))) return;
+    if (batches.some(b => b.status === 'failed')) {
         console.warn(`[erpBatch] IWON ${iwonName} has a failed batch — not sending batch-done`);
         return;
     }
-
-    // Atomic claim: flip batchDoneSentAt on every batch that doesn't have it.
-    // Only the worker whose update actually modifies rows proceeds to notify.
     const claim = await ProvisionBatch.updateMany(
         { iwonName, batchDoneSentAt: { $exists: false } },
         { $set: { batchDoneSentAt: new Date() } }
     );
-    if (!claim.modifiedCount) return;   // already claimed/sent by another settle
-
+    if (!claim.modifiedCount) return;
     await notifyErpBatchDone(iwonName);
 }
 
-// POST the batch-done callback to ERP. Retries a few times; on final failure
-// clears the claim so a later trigger / manual replay can try again.
 async function notifyErpBatchDone(iwonName) {
     const token = process.env.ERP_BRIDGE_TOKEN;
     if (!token) {
@@ -215,11 +245,8 @@ async function notifyErpBatchDone(iwonName) {
     const url = `${ERP_BASE_URL}${ERP_BATCH_DONE_PATH}`;
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            await axios.post(
-                url,
-                { iwonName, status: 'done' },
-                { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, timeout: ERP_NOTIFY_TIMEOUT_MS }
-            );
+            await axios.post(url, { iwonName, status: 'done' },
+                { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, timeout: ERP_NOTIFY_TIMEOUT_MS });
             console.log(`[erpBatch] batch-done sent for ${iwonName}`);
             return true;
         } catch (e) {
@@ -229,7 +256,6 @@ async function notifyErpBatchDone(iwonName) {
             if (attempt < 3) await new Promise(r => setTimeout(r, 1000 * attempt));
         }
     }
-    // Give up for now — unclaim so it can be retried.
     await ProvisionBatch.updateMany({ iwonName }, { $unset: { batchDoneSentAt: '' } }).catch(() => {});
     return false;
 }
