@@ -72,6 +72,10 @@ const provisionedDeviceSchema = new mongoose.Schema({
         certLoad: { type: String, enum: ['pass', 'fail', ''], default: '' },
         tlsHandshake: { type: String, enum: ['pass', 'fail', ''], default: '' },
         mtlsAuth: { type: String, enum: ['pass', 'fail', ''], default: '' },
+        // Cert actually burned INTO the camera post-flash (provision_device.sh
+        // exit code), reported by PPC. Distinct from certHash, which only means
+        // the cert was generated at batch time. Drives the "Installed" tick.
+        certInstall: { type: String, enum: ['pass', 'fail', ''], default: '' },
     },
     // All MACs assigned to this device, kept separate per interface. Single-
     // interface devices have one entry; dual-interface devices (e.g. Eth+WiFi)
