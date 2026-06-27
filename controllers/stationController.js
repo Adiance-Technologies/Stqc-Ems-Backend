@@ -232,6 +232,40 @@ async function logStage(station, dev, stage, ok, message, payload) {
     }).catch(() => {});
 }
 
+// ── POST /api/provision/station/device/:deviceId/cert-install ──────────
+// PPC reports the result of burning the cert INTO the camera (provision_device.sh).
+// Sets tests.certInstall (drives the "Installed" status) + the certBurned stage.
+// Separate from /verify so cert-install can run as its own post-flash step.
+exports.reportCertInstall = catchAsyncErrors(async (req, res) => {
+    const { deviceId } = req.params;
+    const station = resolveStation(req);
+    const { ok, message, payload } = req.body || {};
+    if (!station) return res.status(400).json({ success: false, message: 'station required' });
+
+    const pass = (ok === true || ok === 'pass' || ok === 'true');
+    const now = new Date();
+    const dev = await ProvisionedDevice.findOneAndUpdate(
+        { deviceId },
+        { $set: {
+            'tests.certInstall': pass ? 'pass' : 'fail',
+            'stages.certBurned.done': pass,
+            'stages.certBurned.at': now,
+            currentStage: 'certBurned',
+        } },
+        { new: true }
+    );
+    if (!dev) return res.status(404).json({ success: false, message: `Device ${deviceId} not found` });
+
+    await ProvisionActivity.create({
+        station, deviceId, batchId: dev.batchId, slot: dev.metadata?.jigSlot,
+        type: `cert-install:${pass ? 'pass' : 'fail'}`,
+        message: message || (pass ? 'certificate installed in device' : 'cert install failed'),
+        payload,
+    }).catch(() => {});
+
+    res.json({ ok: true, deviceId, certInstall: pass ? 'pass' : 'fail' });
+});
+
 // ── GET /api/provision/station/batches ─────────────────────────────────
 // Loadable batches for the station's "pick a batch" dropdown — so operators
 // select instead of typing the batchId. Only batches that have been generated
