@@ -16,6 +16,8 @@ const provisioningRoutes = require('./routes/provisioningRoutes');
 const v2Routes = require('./routes/v2Routes');
 // ERP → EMS manufacturing bridge: POST /api/createBatch (token-gated).
 const erpRoutes = require('./routes/erpRoutes');
+// QC App ingest + QC report tracking.
+const qcRoutes = require('./routes/qcRoutes');
 const mqttService = require('./services/mqttService');
 //const supportRoutes = require('./routes/supportRoutes');
 //const batchRoutes = require('./routes/batchRoutes');
@@ -108,6 +110,8 @@ app.use('/api/provision', provisioningRoutes);
 app.use('/api/v2', v2Routes);
 // ERP manufacturing bridge — POST /api/createBatch (token-gated, no JWT).
 app.use('/api', erpRoutes);
+// QC: ingest (mTLS) + reports (admin).
+app.use('/api/qc', qcRoutes);
 //app.use('/api/support', supportRoutes);
 //app.use('/api/production', batchRoutes);
 //app.use('/api/stqc', stqcUserRoutes);
