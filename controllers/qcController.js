@@ -1,3 +1,6 @@
+// External QC Report API — ingest + dashboard reads.
+// The external QC App pushes assembled-camera QC results over mTLS; EMS stores
+// + tracks each as a QC report (upsert per device, secrets redacted).
 const catchAsyncErrors = require('../middleware/catchAsyncErrors');
 const QcReport = require('../models/qcReport');
 
@@ -81,6 +84,7 @@ exports.ingestReport = catchAsyncErrors(async (req, res) => {
 
     res.status(200).json({
         success: true,
+        api: 'external-qc-report',
         deviceFingerprint: fingerprint,
         serialNumber: doc.serialNumber,
         overallStatus: doc.overallStatus,

@@ -5,7 +5,13 @@ const { isAuthenticatedUser, authorizeRoles } = require('../middleware/authMiddl
 
 const router = express.Router();
 
-// ── QC App ingest (strict mTLS — client cert required) ────────
+// ═══════════════════════════════════════════════════════════════
+//  External QC Report API
+//  The external QC App pushes each assembled camera's QC result
+//  here over mutual TLS; EMS stores + tracks it as a QC report.
+// ═══════════════════════════════════════════════════════════════
+
+// ── External QC App ingest (strict mTLS — client cert required) ──
 router.post('/report', qcMtlsOnly, ingestReport);
 
 // ── Dashboard (admin cookie auth) ─────────────────────────────
