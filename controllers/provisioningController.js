@@ -607,6 +607,128 @@ exports.deleteBatch = catchAsyncErrors(async (req, res) => {
     });
 });
 
+// ── PATCH /api/provision/batch/:batchId/firmware ──────────────
+// Edit the firmware bundled with an already-generated batch. Reuses every
+// per-device artefact (certs, keys, OTP, MACs) from the existing signed ZIP —
+// only the firmware/ folder is swapped, then firmware.sha256, batch.json,
+// SHA256SUMS and its HSM signature are regenerated. The old firmware version
+// is dropped from the batch metadata (firmwareVersion/firmwarePath/SHA replaced).
+//
+// Runs in the background (firmware download + re-zip + HSM sign take a few
+// seconds): the batch flips to 'generating', then back to its prior status on
+// success. Poll GET /api/provision/batch/:batchId for the result.
+exports.updateBatchFirmware = catchAsyncErrors(async (req, res) => {
+    const { batchId } = req.params;
+    const { firmwareVersion } = req.body;
+
+    if (!firmwareVersion) {
+        return res.status(400).json({ success: false, message: 'firmwareVersion is required' });
+    }
+
+    const batch = await ProvisionBatch.findOne({ batchId });
+    if (!batch) {
+        return res.status(404).json({ success: false, message: `Batch ${batchId} not found` });
+    }
+    if (batch.status === 'generating') {
+        return res.status(409).json({ success: false, message: `Batch ${batchId} is busy (generating); try again once it settles` });
+    }
+    if (batch.firmwareVersion === firmwareVersion) {
+        return res.status(409).json({ success: false, message: `Batch ${batchId} is already on firmware ${firmwareVersion}` });
+    }
+    // A ZIP must already exist to repack from (certs/keys live only inside it).
+    if (!batch.zipPath || !fs.existsSync(batch.zipPath)) {
+        return res.status(409).json({
+            success: false,
+            message: `Batch ${batchId} has no generated ZIP on disk to repack — recreate the batch instead`,
+        });
+    }
+
+    // The new firmware must be a real GitHub release (with a .bin + .rom).
+    try {
+        await firmwareSource.resolveRelease(firmwareVersion);
+    } catch (e) {
+        return res.status(e.statusCode || 400).json({ success: false, message: e.message });
+    }
+
+    const prevStatus = batch.status;
+    const prevFirmware = batch.firmwareVersion;
+    const sourceZipPath = batch.zipPath;
+    const fwDir = `github:${process.env.FIRMWARE_GH_REPO || 'Adiance-STQC/arcisai-app'}@${firmwareVersion}`;
+
+    // Mark busy so the UI (and concurrent edits) see it's in flight.
+    await ProvisionBatch.updateOne({ batchId }, { status: 'generating', error: null });
+
+    // Note: if some devices are already burned/verified, those shipped on the
+    // OLD firmware — flag it so the response makes the split explicit.
+    const burned = await ProvisionedDevice.countDocuments({ batchId, status: { $in: ['verified', 'failed'] } });
+
+    res.status(202).json({
+        batchId,
+        status: 'generating',
+        message: `Repacking ${batchId} with firmware ${firmwareVersion}. Poll GET /api/provision/batch/${batchId} for status.`,
+        previousFirmware: prevFirmware,
+        firmwareVersion,
+        alreadyBurned: burned,
+        warning: burned > 0
+            ? `${burned} device(s) were already burned/verified on ${prevFirmware} — they keep the old firmware; only the ZIP for the remaining devices changes.`
+            : undefined,
+    });
+
+    // ── Background repack ────────────────────────────────────────────
+    fs.mkdirSync(BATCH_OUTPUT_ROOT, { recursive: true });
+    const logFile = path.join(BATCH_OUTPUT_ROOT, `${batchId}.firmware-update.log`);
+    const logStream = fs.createWriteStream(logFile, { flags: 'w' });
+    const onLog = (line) => logStream.write(line + '\n');
+
+    setImmediate(async () => {
+        try {
+            const result = await batchGenerationService.repackFirmware({
+                batchId,
+                newFirmware: firmwareVersion,
+                sourceZipPath,
+                onLog,
+            });
+            await ProvisionBatch.updateOne(
+                { batchId },
+                {
+                    status: prevStatus,           // restore (ready / in_progress / completed)
+                    firmwareVersion,
+                    firmwarePath: fwDir,
+                    firmwareSha256: result.binSha256,
+                    zipPath: result.zipPath,
+                    zipSha256: result.zipSha256,
+                    zipSizeBytes: result.zipSizeBytes,
+                    generatedAt: new Date(),
+                    error: null,
+                }
+            );
+            onLog(`OK: ${batchId} firmware ${prevFirmware} → ${firmwareVersion}`);
+
+            // Audit trail
+            try {
+                const ProvisionActivity = require('../models/provisionActivity');
+                await ProvisionActivity.create({
+                    station: 'ems',
+                    batchId,
+                    type: 'firmware-update',
+                    message: `firmware ${prevFirmware} → ${firmwareVersion} (repacked + re-signed)`,
+                    operator: req.user ? req.user.email : 'system',
+                    payload: { previousFirmware: prevFirmware, firmwareVersion },
+                });
+            } catch (e) { /* audit must not block */ }
+        } catch (err) {
+            onLog(`ERROR: ${err.stack || err.message}`);
+            // Restore the prior status; firmware metadata is untouched on failure.
+            await ProvisionBatch.updateOne(
+                { batchId },
+                { status: prevStatus, error: `firmware update failed: ${err.message}. See ${logFile}` }
+            );
+        } finally {
+            logStream.end();
+        }
+    });
+});
+
 // ── GET /api/provision/batches ────────────────────────────────
 exports.listBatches = catchAsyncErrors(async (req, res) => {
     const batches = await ProvisionBatch.find()

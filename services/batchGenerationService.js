@@ -404,4 +404,136 @@ async function generateBatch({
     };
 }
 
-module.exports = { generateBatch };
+// ── Public: repackFirmware ────────────────────────────────────────────
+/**
+ * Swap ONLY the firmware in an already-generated batch ZIP and re-sign it.
+ *
+ * Used by the "edit firmware" feature: an EMS officer changes the firmware
+ * bundled with a batch after creation. The expensive, per-device material
+ * (certs, private keys, OTP, MAC assignments, device IDs) is REUSED verbatim
+ * from the existing ZIP — we do NOT re-issue GCP CAS certs or re-allocate
+ * MACs. Only the firmware/ folder is replaced; firmware.sha256, batch.json's
+ * firmware field, the batch-wide SHA256SUMS and its HSM signature are then
+ * regenerated so the signed manifest stays consistent.
+ *
+ *   repackFirmware({ batchId, newFirmware, sourceZipPath, onLog })
+ *     → { ok, batchId, zipPath, zipSha256, zipSizeBytes,
+ *         firmware, binName, romName, binSha256 }
+ *
+ * sourceZipPath is the batch's current zip (batch.zipPath); the repacked ZIP
+ * is written to EMS's BATCH_OUTPUT_ROOT/<batchId>.zip and that path returned
+ * (re-homing legacy MPS-dir ZIPs into EMS). Throws on a missing source ZIP or
+ * an unresolvable firmware tag.
+ */
+async function repackFirmware({ batchId, newFirmware, sourceZipPath, onLog }) {
+    const log = (msg) => {
+        const line = `[repackFirmware ${batchId}] ${msg}`;
+        if (typeof onLog === 'function') onLog(line);
+        console.log(line);
+    };
+
+    if (!batchId || !newFirmware) throw new Error('batchId and newFirmware are required');
+
+    // Validate the target firmware resolves to a real release (.bin + .rom)
+    // before we disturb anything on disk.
+    await firmwareSource.resolveRelease(newFirmware);
+
+    const srcZip = sourceZipPath || path.join(BATCH_OUTPUT_ROOT, `${batchId}.zip`);
+    if (!fs.existsSync(srcZip)) {
+        throw new Error(`source ZIP not found for batch ${batchId}: ${srcZip}`);
+    }
+
+    // Extract the existing ZIP fresh into the batch workspace — this is the
+    // source of truth for every device's certs/keys/otp/mac, none of which we
+    // touch. Rebuilding from the ZIP (not a possibly-stale workDir) guarantees
+    // the repack reflects exactly what was shipped.
+    fs.mkdirSync(BATCH_OUTPUT_ROOT, { recursive: true });
+    const workDir = path.join(BATCH_OUTPUT_ROOT, batchId);
+    fs.rmSync(workDir, { recursive: true, force: true });
+    fs.mkdirSync(workDir, { recursive: true });
+    log(`extracting ${srcZip} → ${workDir}`);
+    new AdmZip(srcZip).extractAllTo(workDir, /* overwrite */ true);
+
+    // ── Replace the firmware/ folder ─────────────────────────────────
+    const fwDir = path.join(workDir, 'firmware');
+    fs.rmSync(fwDir, { recursive: true, force: true });
+    fs.mkdirSync(fwDir, { recursive: true });
+    const fwDownload = await firmwareSource.downloadFirmware(newFirmware, fwDir);
+    log(`firmware ${newFirmware}: bin=${fwDownload.binName} rom=${fwDownload.romName}`);
+
+    // Rebuild firmware/firmware.sha256 over the new firmware files.
+    const fwLines = [];
+    for (const f of fs.readdirSync(fwDir)) {
+        if (f === 'firmware.sha256') continue;
+        const p = path.join(fwDir, f);
+        if (fs.statSync(p).isFile()) fwLines.push(`${sha256File(p)}  ${f}`);
+    }
+    fs.writeFileSync(path.join(fwDir, 'firmware.sha256'), fwLines.join('\n') + '\n');
+    const binSha256 = sha256File(fwDownload.binPath);
+
+    // ── Update batch.json's firmware field (drop the old version) ────
+    const manifestPath = path.join(workDir, 'batch.json');
+    if (fs.existsSync(manifestPath)) {
+        try {
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            manifest.firmware = newFirmware;
+            fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+        } catch (e) {
+            log(`WARN: could not update batch.json firmware field: ${e.message}`);
+        }
+    }
+
+    // ── Regenerate SHA256SUMS over the whole tree (excl. SHA256SUMS*) ─
+    const oldSig = path.join(workDir, 'SHA256SUMS.sig');
+    if (fs.existsSync(oldSig)) fs.unlinkSync(oldSig);
+    const sumsLines = [];
+    (function walk(dir, rel = '.') {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+            const sp = path.join(dir, e.name);
+            const sr = rel === '.' ? `./${e.name}` : `${rel}/${e.name}`;
+            if (e.isDirectory()) walk(sp, sr);
+            else if (e.isFile() && !e.name.startsWith('SHA256SUMS')) sumsLines.push(`${sha256File(sp)}  ${sr}`);
+        }
+    })(workDir);
+    const sumsContent = sumsLines.join('\n') + '\n';
+    fs.writeFileSync(path.join(workDir, 'SHA256SUMS'), sumsContent);
+
+    // ── Re-HSM-sign SHA256SUMS (same firmware-signing key as generation) ─
+    log(`HSM-signing SHA256SUMS with ${KEY_NAME} v${KEY_VERSION} via @google-cloud/kms`);
+    const sig = await hsmSignSha256(Buffer.from(sumsContent, 'utf8'));
+    fs.writeFileSync(path.join(workDir, 'SHA256SUMS.sig'), sig);
+
+    // ── Re-zip every top-level entry (preserves the original layout) ──
+    const zipPath = path.join(BATCH_OUTPUT_ROOT, `${batchId}.zip`);
+    if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+    const zip = new AdmZip();
+    function zipAdd(absPath, zipRel) {
+        const stat = fs.statSync(absPath);
+        if (stat.isDirectory()) {
+            for (const e of fs.readdirSync(absPath)) zipAdd(path.join(absPath, e), zipRel ? `${zipRel}/${e}` : e);
+        } else {
+            zip.addFile(zipRel, fs.readFileSync(absPath));
+        }
+    }
+    for (const top of fs.readdirSync(workDir)) zipAdd(path.join(workDir, top), top);
+    zip.writeZip(zipPath);
+
+    const zipSha256 = sha256File(zipPath);
+    fs.writeFileSync(`${zipPath}.sha256`, `${zipSha256}  ${path.basename(zipPath)}\n`);
+    const zipSizeBytes = fs.statSync(zipPath).size;
+    log(`Done. ZIP=${zipPath} size=${zipSizeBytes} sha256=${zipSha256}`);
+
+    return {
+        ok: true,
+        batchId,
+        zipPath,
+        zipSha256,
+        zipSizeBytes,
+        firmware: newFirmware,
+        binName: fwDownload.binName,
+        romName: fwDownload.romName,
+        binSha256,
+    };
+}
+
+module.exports = { generateBatch, repackFirmware };

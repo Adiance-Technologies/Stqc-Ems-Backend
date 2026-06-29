@@ -7,6 +7,7 @@ const {
     reportVerification,
     listBatches,
     deleteBatch,
+    updateBatchFirmware,
 } = require('../controllers/provisioningController');
 const {
     listProductModels,
@@ -44,6 +45,8 @@ router.get('/batches', isAuthenticatedUser, authorizeRoles('admin'), listBatches
 // have the ZIP anyway, so reading the same data over JSON is no leak.
 router.get('/batch/:batchId', stationOrUser, getBatchStatus);
 router.delete('/batch/:batchId', isAuthenticatedUser, authorizeRoles('admin'), deleteBatch);
+// Edit the firmware bundled with an existing batch (repack + re-sign ZIP).
+router.patch('/batch/:batchId/firmware', isAuthenticatedUser, authorizeRoles('admin'), updateBatchFirmware);
 
 // ── Station-callable endpoints (accept station API key OR admin cookie) ──
 router.get('/batch/:batchId/download', stationOrUser, downloadBatch);
