@@ -117,9 +117,7 @@ exports.createErpBatch = catchAsyncErrors(async (req, res) => {
         const connTypes = macAllocator.connectionToTypes(it.connection) || sku?.connectionTypes;
         const macTypes = macAllocator.macBearingTypes(connTypes || []);
         if (!macTypes.length) {
-            row.resolveError = macAllocator.connectionToTypes(it.connection) || sku
-                ? 'connection has no Eth/WiFi interface to assign a MAC'
-                : `unknown connection '${it.connection}' — expected PoE/Ethernet, WiFi, or 4G`;
+            row.resolveError = `connection missing for '${modelNumber}' — ERP camera type must have a connection (PoE/WiFi/4G/…) set`;
             resolvedItems.push(row);
             continue;
         }

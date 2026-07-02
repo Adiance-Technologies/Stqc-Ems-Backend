@@ -33,22 +33,23 @@ function macBearingTypes(connectionTypes) {
     return MAC_BEARING_TYPES.filter(t => set.has(t));
 }
 
-// Map a single free-form connection string (as ERP/operator picks it) to the
-// full interface set for that device — the single source of truth for both the
-// ERP bridge and the manual create form. A WiFi camera also carries Ethernet
-// (Eth = HwMac, WiFi = WifiMac); a 4G camera carries Ethernet (4G gets no MAC).
-//   poe/eth/lan/rj45 → ['Eth']
-//   wifi/wireless/wlan → ['Eth','WIFI']
-//   4g/lte/cellular/gsm/gprs → ['4G','Eth']
-// Returns null for an unrecognized connection.
-const CONNECTION_TO_TYPES = {
-    poe: ['Eth'], eth: ['Eth'], ethernet: ['Eth'], lan: ['Eth'], rj45: ['Eth'],
-    wifi: ['Eth', 'WIFI'], wireless: ['Eth', 'WIFI'], wlan: ['Eth', 'WIFI'],
-    '4g': ['4G', 'Eth'], lte: ['4G', 'Eth'], cellular: ['4G', 'Eth'], gsm: ['4G', 'Eth'], gprs: ['4G', 'Eth'],
-};
+// Map a free-form connection string (as ERP/operator picks it) to the full
+// interface set for that device — the single source of truth for both the ERP
+// bridge and the manual create form. Handles ERP's compound values too
+// (wifi | 4g | 5g | poe | ip | wifi+poe | 4g+poe).
+//
+// Rule: EVERY device gets an Ethernet MAC (→ HwMac). A WiFi interface adds a
+// WiFi MAC (→ WifiMac). Cellular (4g/5g) carries no MAC of its own (SIM/IMEI),
+// so a 4G/5G device just gets the Eth MAC. So:
+//   poe / ip / eth / 4g / 5g / 4g+poe → ['Eth']
+//   wifi / wifi+poe / wireless        → ['Eth','WIFI']
+// Returns null only for an empty/unspecified connection (caller errors on it).
 function connectionToTypes(raw) {
-    const k = String(raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    return CONNECTION_TO_TYPES[k] || null;
+    const k = String(raw || '').toLowerCase();
+    if (!k.trim()) return null;                    // empty → can't decide, caller flags it
+    const types = ['Eth'];                          // base: Ethernet MAC = HwMac
+    if (/wifi|wireless|wlan/.test(k)) types.push('WIFI');
+    return types;
 }
 
 // Format hex (12 char) → "80:77:86:50:00:01" for display / mac.txt
