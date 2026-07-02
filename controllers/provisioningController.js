@@ -76,15 +76,16 @@ function encodeDeviceIdUint32(serial, familyCode) {
 // Create a batch: persist rows, spawn batch_generate.sh in background, return immediately.
 exports.createBatch = catchAsyncErrors(async (req, res) => {
     // Manual operator flow. The model number now comes from ERP, so the dashboard
-    // only asks for IWON + family + firmware + count. Connection type defaults to
-    // Eth (single MAC) — dual-interface Eth+WiFi is an ERP-only, model-driven
-    // feature — and the device-ID range is auto-allocated per family.
+    // asks for IWON + family + firmware + count + connectivity. Connectivity
+    // decides which interfaces get a MAC (Eth → HwMac, WiFi → WifiMac; 4G never
+    // gets a MAC). The device-ID range is auto-allocated per family.
     const {
         iwon,                  // accept either iwon or batchId — same field, different names
         batchId: bodyBatchId,
         family,
         firmwareVersion,
         count,
+        connectivity,          // 'eth' | 'eth+wifi' | '4g+eth' (default 'eth')
     } = req.body;
 
     const iwonRaw = iwon || bodyBatchId;
@@ -115,6 +116,27 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
     if (!Number.isFinite(parsedCount) || parsedCount < 1 || parsedCount > 10000) {
         return res.status(400).json({ success: false, message: 'count must be 1–10000' });
     }
+
+    // Connectivity → the interface set for this batch. macBearingTypes drops 4G
+    // (SIM/IMEI-identified, no MAC), so 4g+eth yields an Eth MAC only.
+    const CONNECTIVITY = {
+        'eth':      ['Eth'],
+        'eth+wifi': ['Eth', 'WIFI'],
+        '4g+eth':   ['4G', 'Eth'],
+    };
+    const connKey = String(connectivity || 'eth').toLowerCase();
+    if (!CONNECTIVITY.hasOwnProperty(connKey)) {
+        return res.status(400).json({
+            success: false,
+            message: `Invalid connectivity. Must be one of: ${Object.keys(CONNECTIVITY).join(', ')}`,
+        });
+    }
+    const connectionTypes = CONNECTIVITY[connKey];
+    const macTypes = macAllocator.macBearingTypes(connectionTypes);   // e.g. ['Eth','WIFI']
+    if (!macTypes.length) {
+        return res.status(400).json({ success: false, message: 'Selected connectivity has no MAC-bearing interface (Eth/WiFi)' });
+    }
+    const primaryConnection = macTypes[0];   // batch.json / mac.txt header (Eth for all current options)
 
     // Uniqueness pre-check (the unique index on batchId is the real guarantee).
     const dup = await ProvisionBatch.findOne({ batchId: iwonClean }).lean();
@@ -150,8 +172,8 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
             family,
             firmwareVersion,
             fwDir,
-            connectionType: 'Eth',     // default; dual-MAC is ERP/model-driven only
-            macTypes: ['Eth'],
+            connectionType: primaryConnection,   // operator-selected connectivity
+            macTypes,                             // Eth and/or WiFi (one MAC per type)
             count: parsedCount,
             serialStart: range.serialStart,
             serialEnd: range.serialEnd,
@@ -180,7 +202,8 @@ exports.createBatch = catchAsyncErrors(async (req, res) => {
         firmwareVersion,
         startDeviceId: range.startDeviceId,
         endDeviceId: range.endDeviceId,
-        connectionType: 'Eth',
+        connectionType: primaryConnection,
+        macTypes,
         hsmKeyRef: HSM_KEY_REF,
         rootCaHash: ROOT_CA_HASH,
         rotpkHex: ROTPK_HEX,
