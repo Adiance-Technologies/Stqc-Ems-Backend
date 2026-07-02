@@ -35,6 +35,9 @@ const ERP_BATCH_DONE_PATH = process.env.ERP_BATCH_DONE_PATH || '/api/request/bat
 const ERP_NOTIFY_TIMEOUT_MS = 8000;
 
 // Map ERP's free-text connection label → EMS connectionType enum (PoE = Ethernet).
+// Manufacturing families that can appear in a device ID (ATPL-NNNNNN-FAMILY).
+const VALID_FAMILIES = ['SECOS', 'AUGEN', '4GBDP', 'WFBDP'];
+
 function mapConnection(raw) {
     const k = String(raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     if (['poe', 'eth', 'ethernet', 'lan', 'rj45'].includes(k)) return 'Eth';
@@ -84,6 +87,7 @@ exports.createErpBatch = catchAsyncErrors(async (req, res) => {
         const row = {
             modelNumber,
             connection: it.connection || '',
+            enclosure: it.enclosure || '',
             connectionType,
             quantity: Number.isFinite(qty) ? qty : 0,
         };
@@ -91,16 +95,35 @@ exports.createErpBatch = catchAsyncErrors(async (req, res) => {
         if (!modelNumber) { row.resolveError = 'modelNumber missing'; resolvedItems.push(row); continue; }
         if (!Number.isFinite(qty) || qty < 1) { row.resolveError = 'quantity must be >= 1'; resolvedItems.push(row); continue; }
 
+        // MAC interfaces come from ERP's connection choice (poe→Eth, wifi→Eth+WiFi,
+        // 4g→4G+Eth). Optional product_models catalog is only a fallback for
+        // family / suggested firmware when ERP doesn't send them.
         const sku = await ProductModel.findOne({ sku: modelNumber.toUpperCase() }).lean();
-        if (!sku) { row.resolveError = `SKU not found in product_models`; resolvedItems.push(row); continue; }
-        row.sku = sku.sku;
-        row.family = sku.family || null;
-        if (!sku.family) { row.resolveError = 'SKU has no family in catalog'; resolvedItems.push(row); continue; }
+        row.sku = sku?.sku || modelNumber.toUpperCase();
+        row.suggestedFirmware = sku?.defaultFirmware || null;   // operator may override
 
-        const macTypes = macAllocator.macBearingTypes(sku.connectionTypes);
-        if (!macTypes.length) { row.resolveError = 'SKU has no Eth/WiFi interface to assign a MAC'; resolvedItems.push(row); continue; }
-        row.macTypes = macTypes;
-        row.suggestedFirmware = sku.defaultFirmware || null;   // operator may override
+        // Family: ERP-supplied first, catalog fallback. Required (goes into the device ID).
+        const family = String(it.family || sku?.family || '').toUpperCase();
+        if (!VALID_FAMILIES.includes(family)) {
+            row.resolveError = it.family
+                ? `Invalid family '${it.family}' — must be one of ${VALID_FAMILIES.join(', ')}`
+                : `family missing — ERP must send it (one of ${VALID_FAMILIES.join(', ')}) or add the SKU to product_models`;
+            resolvedItems.push(row);
+            continue;
+        }
+        row.family = family;
+
+        // Interfaces from connection; catalog connectionTypes as a fallback.
+        const connTypes = macAllocator.connectionToTypes(it.connection) || sku?.connectionTypes;
+        const macTypes = macAllocator.macBearingTypes(connTypes || []);
+        if (!macTypes.length) {
+            row.resolveError = macAllocator.connectionToTypes(it.connection) || sku
+                ? 'connection has no Eth/WiFi interface to assign a MAC'
+                : `unknown connection '${it.connection}' — expected PoE/Ethernet, WiFi, or 4G`;
+            resolvedItems.push(row);
+            continue;
+        }
+        row.macTypes = macTypes;   // e.g. WiFi → ['Eth','WIFI'] (Eth=HwMac, WiFi=WifiMac)
         resolvedItems.push(row);
     }
 
@@ -117,7 +140,7 @@ exports.createErpBatch = catchAsyncErrors(async (req, res) => {
         iwonName: iwon,
         queued: true,
         message: `IWON '${iwon}' queued in EMS. An operator will choose firmware and create the batches.`,
-        items: resolvedItems.map(r => ({ modelNumber: r.modelNumber, sku: r.sku, family: r.family, quantity: r.quantity, macTypes: r.macTypes, suggestedFirmware: r.suggestedFirmware, resolveError: r.resolveError })),
+        items: resolvedItems.map(r => ({ modelNumber: r.modelNumber, sku: r.sku, family: r.family, connection: r.connection, enclosure: r.enclosure, connectionType: r.connectionType, quantity: r.quantity, macTypes: r.macTypes, suggestedFirmware: r.suggestedFirmware, resolveError: r.resolveError })),
         pendingId: String(pending._id),
     });
 });

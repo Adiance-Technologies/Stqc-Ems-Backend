@@ -10,6 +10,7 @@ const pendingItemSchema = new mongoose.Schema({
     sku: { type: String },                  // resolved SKU (uppercased) or null
     family: { type: String },               // resolved family or null
     connection: { type: String },           // raw connection label from ERP
+    enclosure: { type: String },            // raw enclosure label from ERP (DOME/BULLET/…)
     connectionType: { type: String },       // mapped Eth/WIFI/4G or null
     macTypes: { type: [String], default: undefined }, // MAC-bearing types (Eth/WiFi)
     quantity: { type: Number },
