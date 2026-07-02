@@ -76,6 +76,11 @@ const provisionedDeviceSchema = new mongoose.Schema({
         // exit code), reported by PPC. Distinct from certHash, which only means
         // the cert was generated at batch time. Drives the "Installed" tick.
         certInstall: { type: String, enum: ['pass', 'fail', ''], default: '' },
+        // MAC + hardware identity burned into the camera via the firmware's
+        // HwProvision API (PUT /netsdk/v2/R/HwProvision), reported by PPC in the
+        // cert-install callback. 'skipped' = HwProvision bypassed for this device
+        // (e.g. CERT_INSTALL_SKIP_HWPROVISION). Drives the "MAC" status column.
+        macProvision: { type: String, enum: ['pass', 'fail', 'skipped', ''], default: '' },
     },
     // All MACs assigned to this device, kept separate per interface. Single-
     // interface devices have one entry; dual-interface devices (e.g. Eth+WiFi)

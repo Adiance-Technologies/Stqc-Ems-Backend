@@ -36,6 +36,35 @@ function resolveStation(req) {
     );
 }
 
+// Hardware identity the station burns into the camera via HwProvision
+// (PUT /netsdk/v2/R/HwProvision). Derived from the device record so PPC never
+// has to compute it:
+//   hwSerial       — 12-char SerialNumber = "AD" + 10-digit zero-padded counter
+//                    (e.g. counter 406352 → "AD0000406352"). extSN2 = deviceId.
+//   mac            — primary/Ethernet MAC → HwMac (falls back to WiFi, then any).
+//   macsAdditional — the remaining MACs (WiFi first) → WifiMac for WiFi SKUs.
+const HW_ID_RE = /^[0-9A-Za-z-]+$/;
+function hwSerialFor(dev) {
+    const n = Number(dev.serialNumber);
+    if (!Number.isFinite(n) || n < 0) return null;
+    const s = 'AD' + String(Math.trunc(n)).padStart(10, '0');
+    // Guard the HwProvision contract: exactly 12 chars, [0-9A-Za-z-]. A counter
+    // above 10 digits (>9,999,999,999) would overflow — flag rather than send junk.
+    return s.length === 12 && HW_ID_RE.test(s) ? s : null;
+}
+function macFieldsFor(dev) {
+    const list = Array.isArray(dev.macs) ? dev.macs.filter((m) => m && m.mac) : [];
+    const eth  = list.find((m) => m.type === 'Eth');
+    const wifi = list.find((m) => m.type === 'WIFI');
+    // Map by interface type, as stored in macs[]:
+    //   mac      → HwMac  = the Ethernet MAC (fallback to legacy metadata.macAddress)
+    //   wifiMac  → WifiMac = the WiFi MAC (only WiFi SKUs have one)
+    const mac = (eth && eth.mac) || dev.metadata?.macAddress || null;
+    const wifiMac = (wifi && wifi.mac) || null;
+    // macsAdditional kept for back-compat (macsAdditional[0] === wifiMac).
+    return { mac, wifiMac, macsAdditional: wifiMac ? [wifiMac] : [] };
+}
+
 // ── POST /api/provision/station/batch/:batchId/reserve ────────────────
 // Body: { station, count, slots: [1,2,3,4,5,6] }
 // Atomically claims `count` devices from the batch's pool. Returns the
@@ -80,13 +109,17 @@ exports.reserveDevices = catchAsyncErrors(async (req, res) => {
             { sort: { serialNumber: 1 }, new: true }
         );
         if (!dev) break;
+        const macf = macFieldsFor(dev);
         reserved.push({
             deviceId:       dev.deviceId,
             slot:           dev.metadata?.jigSlot,
             family:         dev.family,
             otpEncoded:     dev.otpEncoded,
             certHash:       dev.certHash,
-            mac:            dev.metadata?.macAddress || null,
+            // HwProvision identity (12-char serial + MACs) — see hwSerialFor/macFieldsFor.
+            hwSerial:       hwSerialFor(dev),
+            mac:            macf.mac,
+            macsAdditional: macf.macsAdditional,
             connectionType: batch.connectionType || null,
             // Station opens these from its local extracted ZIP at:
             //   <batch_cache>/<batchId>/devices/<deviceId>/{otp.bin, *_cert.pem, *_key.pem}
@@ -239,31 +272,47 @@ async function logStage(station, dev, stage, ok, message, payload) {
 exports.reportCertInstall = catchAsyncErrors(async (req, res) => {
     const { deviceId } = req.params;
     const station = resolveStation(req);
-    const { ok, message, payload } = req.body || {};
+    const { ok, message, payload, macProvision } = req.body || {};
     if (!station) return res.status(400).json({ success: false, message: 'station required' });
 
     const pass = (ok === true || ok === 'pass' || ok === 'true');
     const now = new Date();
+
+    // MAC + hardware identity burned in the same step via the HwProvision API.
+    // Tri-state: pass | fail | skipped ('' when PPC omits it — older stations).
+    const macRaw = String(macProvision ?? '').toLowerCase();
+    const mac = ['pass', 'fail', 'skipped'].includes(macRaw) ? macRaw : '';
+
+    const set = {
+        'tests.certInstall': pass ? 'pass' : 'fail',
+        'stages.certBurned.done': pass,
+        'stages.certBurned.at': now,
+        currentStage: 'certBurned',
+    };
+    if (mac) {
+        set['tests.macProvision'] = mac;
+        // A confirmed MAC burn advances the macBurned lifecycle stage too, so the
+        // stage strip lights up even if PPC's fire-and-forget reportStage missed.
+        if (mac === 'pass') {
+            set['stages.macBurned.done'] = true;
+            set['stages.macBurned.at'] = now;
+        }
+    }
+
     const dev = await ProvisionedDevice.findOneAndUpdate(
-        { deviceId },
-        { $set: {
-            'tests.certInstall': pass ? 'pass' : 'fail',
-            'stages.certBurned.done': pass,
-            'stages.certBurned.at': now,
-            currentStage: 'certBurned',
-        } },
-        { new: true }
+        { deviceId }, { $set: set }, { new: true }
     );
     if (!dev) return res.status(404).json({ success: false, message: `Device ${deviceId} not found` });
 
     await ProvisionActivity.create({
         station, deviceId, batchId: dev.batchId, slot: dev.metadata?.jigSlot,
         type: `cert-install:${pass ? 'pass' : 'fail'}`,
-        message: message || (pass ? 'certificate installed in device' : 'cert install failed'),
+        message: (message || (pass ? 'certificate installed in device' : 'cert install failed'))
+            + (mac ? ` (mac ${mac})` : ''),
         payload,
     }).catch(() => {});
 
-    res.json({ ok: true, deviceId, certInstall: pass ? 'pass' : 'fail' });
+    res.json({ ok: true, deviceId, certInstall: pass ? 'pass' : 'fail', macProvision: mac || undefined });
 });
 
 // ── GET /api/provision/station/batches ─────────────────────────────────
@@ -321,11 +370,16 @@ exports.listStationDevices = catchAsyncErrors(async (req, res) => {
         if (b) b.push(d);
     }
 
+    // Surface the derived HwProvision identity (12-char serial + flat MAC +
+    // macsAdditional) on each device so PPC can burn MAC/hardware identity
+    // without recomputing anything. Keeps all existing raw fields intact.
+    const enriched = devices.map((d) => ({ ...d, hwSerial: hwSerialFor(d), ...macFieldsFor(d) }));
+
     res.json({
         ok: true,
         batchId, station,
         counts: Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length])),
-        devices,
+        devices: enriched,
     });
 });
 
