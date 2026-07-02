@@ -271,6 +271,9 @@ async function provisionSingleModelBatch({
         const serial = serialStart + idx;
         const entries = macAssignment.get(deviceId) || [];
         const macs = entries.map(e => ({ type: e.type, mac: macAllocator.formatMac(e.mac) }));
+        const ethMac = (macs.find(x => x.type === 'Eth') || macs[0] || {}).mac || null;
+        // 12-char HwProvision SerialNumber = "AD" + 10-digit zero-padded counter.
+        const hwSerial = 'AD' + String(serial).padStart(10, '0');
         return {
             deviceId,
             batchId,
@@ -282,9 +285,10 @@ async function provisionSingleModelBatch({
             otpEncoded: '0x' + encodeDeviceIdUint32(serial, familyCode).toString(16).toUpperCase().padStart(8, '0'),
             status: 'allocated',
             macs,
-            // Denormalized snapshot of the primary MAC for quick display.
-            // mac_pool / macs[] are the source of truth.
-            metadata: { macAddress: macs[0] ? macs[0].mac : null },
+            // Denormalized snapshot of the primary (Eth = HwMac) MAC + the 12-char
+            // HwProvision serial for quick display. mac_pool / macs[] are the
+            // source of truth for MACs.
+            metadata: { macAddress: ethMac, serialNumber: hwSerial },
         };
     });
 

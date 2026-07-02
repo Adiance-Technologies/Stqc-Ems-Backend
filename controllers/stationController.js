@@ -110,6 +110,7 @@ exports.reserveDevices = catchAsyncErrors(async (req, res) => {
         );
         if (!dev) break;
         const macf = macFieldsFor(dev);
+        const serial12 = dev.metadata?.serialNumber || hwSerialFor(dev);
         reserved.push({
             deviceId:       dev.deviceId,
             slot:           dev.metadata?.jigSlot,
@@ -117,7 +118,8 @@ exports.reserveDevices = catchAsyncErrors(async (req, res) => {
             otpEncoded:     dev.otpEncoded,
             certHash:       dev.certHash,
             // HwProvision identity (12-char serial + MACs) — see hwSerialFor/macFieldsFor.
-            hwSerial:       hwSerialFor(dev),
+            serialNumber:   serial12,
+            hwSerial:       serial12,
             mac:            macf.mac,
             macsAdditional: macf.macsAdditional,
             connectionType: batch.connectionType || null,
@@ -373,7 +375,15 @@ exports.listStationDevices = catchAsyncErrors(async (req, res) => {
     // Surface the derived HwProvision identity (12-char serial + flat MAC +
     // macsAdditional) on each device so PPC can burn MAC/hardware identity
     // without recomputing anything. Keeps all existing raw fields intact.
-    const enriched = devices.map((d) => ({ ...d, hwSerial: hwSerialFor(d), ...macFieldsFor(d) }));
+    // The station reads d.serialNumber || d.metadata.serialNumber for the 12-char
+    // HwProvision serial, so present it there (persisted metadata.serialNumber wins,
+    // else derived). hwSerial kept as an explicit alias. macFieldsFor adds mac +
+    // macsAdditional + wifiMac. The numeric counter is intentionally overridden here
+    // (station-only response; EMS internals still use the stored numeric).
+    const enriched = devices.map((d) => {
+        const serial12 = d.metadata?.serialNumber || hwSerialFor(d);
+        return { ...d, serialNumber: serial12, hwSerial: serial12, ...macFieldsFor(d) };
+    });
 
     res.json({
         ok: true,

@@ -93,6 +93,10 @@ const provisionedDeviceSchema = new mongoose.Schema({
     }],
     metadata: {
         macAddress: { type: String },
+        // 12-char hardware SerialNumber for the firmware's HwProvision API
+        // ("AD" + 10-digit zero-padded counter, e.g. AD0000900023). Distinct
+        // from the numeric serialNumber counter and the 17-char deviceId (extSN2).
+        serialNumber: { type: String },
         firmwareVersion: { type: String },
         seChipPresent: { type: Boolean },
         vendorOtpId: { type: String },
