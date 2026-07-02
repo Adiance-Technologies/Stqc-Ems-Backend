@@ -355,13 +355,14 @@ exports.listStationDevices = catchAsyncErrors(async (req, res) => {
     const station = resolveStation(req);
     if (!station) return res.status(400).json({ success: false, message: 'station required' });
 
-    const devices = await ProvisionedDevice.find({
-        batchId,
-        $or: [
-            { 'metadata.station': station },                           // mine
-            { status: 'provisioned', 'metadata.station': null },       // available pool (no owner)
-        ],
-    }).sort({ serialNumber: 1 }).lean();
+    // Return the WHOLE batch. The station needs to see every device — not just
+    // available/owned ones — so post-burn steps (cert-install / HwProvision
+    // MAC-burn) can re-run against already-verified/failed devices too. The
+    // status buckets below still tell the operator what's available vs done.
+    // (Was filtered to provisioned+mine, which hid verified/failed devices and
+    // blocked re-burning MAC/serial on a completed batch.)
+    const devices = await ProvisionedDevice.find({ batchId })
+        .sort({ serialNumber: 1 }).lean();
 
     const buckets = { provisioned: [], reserved: [], burning: [], verified: [], failed: [] };
     for (const d of devices) {
